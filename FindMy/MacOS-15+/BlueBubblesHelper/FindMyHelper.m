@@ -6,6 +6,7 @@
 #import "FindMyDeviceSnapshotBridge.h"
 #import "FindMyDevicesDataSourceCapture.h"
 #import "FindMyDevicesRefreshCoordinator.h"
+#import "FindMyFriendPayload.h"
 #import "FindMyFriendsRefreshCoordinator.h"
 #import "ServerConnection.h"
 
@@ -14,6 +15,7 @@ static const NSTimeInterval BBFriendListTimeoutSeconds = 5.0;
 static const NSTimeInterval BBLocationRefreshTimeoutSeconds = 8.0;
 static const NSTimeInterval BBDevicesDataSourceTimeoutSeconds = 5.0;
 static const NSTimeInterval BBDevicesDataSourcePollIntervalSeconds = 0.1;
+static const long long BBLiveLocationRefreshPriority = 1000;
 
 @interface FindMyHelper ()
 @property(nonatomic, strong, nullable) FindMyLocateSession *activeLocateSession;
@@ -139,6 +141,23 @@ static os_log_t helperLog;
 
     self.activeLocateSession = [[locateSessionClass alloc] init];
 
+    if ([self.activeLocateSession respondsToSelector:@selector(setLocationUpdateCallback:)]) {
+        [self.activeLocateSession setLocationUpdateCallback:^(id _Nullable location, id handle) {
+            NSDictionary *locationPayload = [FindMyFriendPayload locationPayloadForLocation:location handle:handle];
+            if (locationPayload == nil) {
+                return;
+            }
+            id coordinates = locationPayload[@"coordinates"];
+            if (![coordinates isKindOfClass:[NSArray class]]) {
+                return;
+            }
+            [[ServerConnection sharedInstance] sendMessage:@{
+                @"event": @"new-findmy-location",
+                @"data": @[locationPayload],
+            }];
+        }];
+    }
+
     if ([self.activeLocateSession respondsToSelector:@selector(startUpdatingFriendsWithInitialUpdates:completion:)]) {
         [self.activeLocateSession startUpdatingFriendsWithInitialUpdates:YES completion:^{
             os_log(helperLog, "Find My friend updates started");
@@ -152,6 +171,56 @@ static os_log_t helperLog;
     }
 
     return self.activeLocateSession;
+}
+
+- (void)startStreamingLocationsForAllFriends:(FindMyLocateSession *)session {
+    void (^refreshHandles)(NSArray * _Nullable) = ^(NSArray * _Nullable friendRecords) {
+        if (![friendRecords isKindOfClass:[NSArray class]] || friendRecords.count == 0) {
+            return;
+        }
+        NSMutableArray *handles = [[NSMutableArray alloc] initWithCapacity:friendRecords.count];
+        SEL handleSelector = NSSelectorFromString(@"handle");
+        for (id friendRecord in friendRecords) {
+            id handle = friendRecord;
+            if ([friendRecord respondsToSelector:handleSelector]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                id extracted = [friendRecord performSelector:handleSelector];
+#pragma clang diagnostic pop
+                if (extracted != nil) {
+                    handle = extracted;
+                }
+            }
+            if (handle != nil && [FindMyFriendPayload identifierForHandle:handle] != nil) {
+                [handles addObject:handle];
+            }
+        }
+        if (handles.count == 0) {
+            return;
+        }
+        if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:reverseGeocode:completion:)]) {
+            [session startRefreshingLocationForHandles:handles
+                                              priority:BBLiveLocationRefreshPriority
+                                           isFromGroup:NO
+                                        reverseGeocode:YES
+                                            completion:^{}];
+        } else if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
+            [session startRefreshingLocationForHandles:handles
+                                              priority:BBLiveLocationRefreshPriority
+                                           isFromGroup:NO
+                                            completion:^{}];
+        }
+    };
+
+    if ([session respondsToSelector:@selector(getFriendsSharingLocationsWithMeWithCompletion:)]) {
+        [session getFriendsSharingLocationsWithMeWithCompletion:^(NSArray * _Nullable friendRecords) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                refreshHandles(friendRecords);
+            });
+        }];
+    } else if ([session respondsToSelector:@selector(cachedFriendsSharingLocationsWithMe)]) {
+        refreshHandles([session cachedFriendsSharingLocationsWithMe]);
+    }
 }
 
 - (void)handleFriendsRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier {
@@ -171,8 +240,11 @@ static os_log_t helperLog;
         responseHandler:^(NSDictionary *response) {
             [[ServerConnection sharedInstance] sendMessage:response];
             FindMyHelper *strongSelf = weakSelf;
-            if (strongSelf != nil && weakCoordinator != nil) {
-                [strongSelf.activeFriendRefreshes removeObject:weakCoordinator];
+            if (strongSelf != nil) {
+                if (weakCoordinator != nil) {
+                    [strongSelf.activeFriendRefreshes removeObject:weakCoordinator];
+                }
+                [strongSelf startStreamingLocationsForAllFriends:session];
             }
         }];
     weakCoordinator = coordinator;

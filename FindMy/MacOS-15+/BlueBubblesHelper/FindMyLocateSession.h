@@ -4,6 +4,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^FindMyCompletion)(void);
 typedef void (^FindMyFriendsCompletion)(NSArray * _Nullable friendRecords);
+typedef void (^FindMyLocationUpdateCallback)(id _Nullable location, id handle);
 
 @protocol FindMyLocateSessionProtocol <NSObject>
 
@@ -14,6 +15,7 @@ typedef void (^FindMyFriendsCompletion)(NSArray * _Nullable friendRecords);
 - (nullable NSArray *)cachedFriendsSharingLocationWithMe;
 - (nullable NSArray *)cachedFriendsSharingLocationsWithMe;
 - (void)getFriendsSharingLocationsWithMeWithCompletion:(FindMyFriendsCompletion)completion;
+- (void)setLocationUpdateCallback:(nullable FindMyLocationUpdateCallback)callback;
 - (void)startMonitoringActiveLocationSharingDeviceChangeWithCompletion:(FindMyCompletion)completion;
 - (void)startRefreshingLocationForHandles:(NSArray *)locationHandles
                                   priority:(long long)priority
