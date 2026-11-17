@@ -7,7 +7,13 @@ SOURCE_DIR="$ROOT_DIR/BlueBubblesHelper"
 SOCKET_DIR="$ROOT_DIR/Pods/CocoaAsyncSocket/Source/GCD"
 BUILD_DIR="$ROOT_DIR/.build/tests"
 MODULE_CACHE_DIR="$BUILD_DIR/module-cache"
-DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+if [[ -z "${DEVELOPER_DIR:-}" ]]; then
+    if [[ -d "/Applications/Xcode.app/Contents/Developer" ]]; then
+        DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+    else
+        DEVELOPER_DIR="/Library/Developer/CommandLineTools"
+    fi
+fi
 
 export DEVELOPER_DIR
 export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE_DIR"

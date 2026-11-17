@@ -2,3 +2,4 @@
 **/*.xcuserdatad
 FindMy/MacOS-15+/.build/
 FindMy/MacOS-15+/dist/
+/build/
