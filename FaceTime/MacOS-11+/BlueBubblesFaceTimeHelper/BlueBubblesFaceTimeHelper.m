@@ -17,9 +17,43 @@
 #import "CSDConversation.h"
 #import "CSDConversationManager.h"
 #import "TUCall.h"
+#import "TUHandle.h"
+
+@interface TUCallProvider : NSObject
+@property (nonatomic, readonly, copy) NSString *identifier;
+@property (nonatomic, readonly, getter=isFaceTimeProvider) BOOL faceTimeProvider;
+@property (nonatomic, readonly, getter=isTelephonyProvider) BOOL telephonyProvider;
+@end
+
+@interface TUCallProviderManager : NSObject
+@property (nonatomic, readonly) TUCallProvider *faceTimeProvider;
+@property (nonatomic, readonly) TUCallProvider *telephonyProvider;
+@end
+
+@interface TUDialRequest : NSObject
+- (instancetype)initWithProvider:(TUCallProvider *)provider;
+@property (nonatomic, retain) TUHandle *handle;
+@property (nonatomic, copy) NSSet<TUHandle *> *handles;
+@property (nonatomic, getter=isVideo) BOOL video;
+@property (nonatomic, readonly, getter=isValid) BOOL valid;
+@end
+
+@interface TUCallCenter (Dialing)
+- (void)dialWithRequest:(id)request completionWithError:(void (^)(TUCall *call, NSError *error))completion;
+@end
+
+static NSString *BBExtractCallUUID(NSDictionary *data) {
+    if (![data isKindOfClass:[NSDictionary class]]) return nil;
+    id val = data[@"callUUID"];
+    if (![val isKindOfClass:[NSString class]]) val = data[@"call_uuid"];
+    return ([val isKindOfClass:[NSString class]] && [(NSString *)val length] > 0) ? val : nil;
+}
 
 @interface BLUEBUBBLESFACETIMEHELPER : NSObject
 + (instancetype)sharedInstance;
+- (NSDictionary *)callStatusPayloadForCall:(TUCall *)call;
+- (void)callStatusChanged:(NSNotification *)notification;
+- (void)handleMessage:(NetworkController *)controller message:(NSString *)message;
 @end
 
 // This can be used to dump the methods of any class
@@ -127,9 +161,17 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
     });
 }
 
--(void) callStatusChanged: (NSNotification *)notification {
-    TUProxyCall *call = [notification object];
-    NSDictionary *data = @{
+-(NSDictionary *) callStatusPayloadForCall:(TUCall *)call {
+    if (call == nil) return nil;
+    id provider = [call respondsToSelector:@selector(provider)] ? [call provider] : nil;
+    NSString *providerIdentifier = [provider respondsToSelector:@selector(identifier)] ? [(TUCallProvider *)provider identifier] : nil;
+    BOOL isTelephonyProvider = [provider respondsToSelector:@selector(isTelephonyProvider)] && [(TUCallProvider *)provider isTelephonyProvider];
+    BOOL isFaceTimeProvider = [provider respondsToSelector:@selector(isFaceTimeProvider)] && [(TUCallProvider *)provider isFaceTimeProvider];
+    BOOL isHostedOnCurrentDevice = [call respondsToSelector:@selector(isHostedOnCurrentDevice)] ? [call isHostedOnCurrentDevice] : YES;
+    BOOL isTelephony = isTelephonyProvider || (!isFaceTimeProvider && !isHostedOnCurrentDevice);
+    BOOL isVideo = [call respondsToSelector:@selector(isVideo)] ? [call isVideo] : [call isSendingVideo];
+
+    return @{
         @"audio_mode": [call audioMode] ?: [NSNull null],
         @"call_status": [NSNumber numberWithInt:[call callStatus]] ?: [NSNull null],
         @"call_uuid": [call callUUID] ?: [NSNull null],
@@ -141,7 +183,16 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         @"is_sending_audio": [NSNumber numberWithBool:[call isSendingAudio]] ?: [NSNull null],
         @"is_sending_video": [NSNumber numberWithBool:[call isSendingVideo]] ?: [NSNull null],
         @"is_outgoing": [NSNumber numberWithBool:[call isOutgoing]] ?: [NSNull null],
+        @"is_video": [NSNumber numberWithBool:isVideo],
+        @"is_telephony": [NSNumber numberWithBool:isTelephony],
+        @"provider_identifier": providerIdentifier ?: [NSNull null],
     };
+}
+
+-(void) callStatusChanged: (NSNotification *)notification {
+    TUCall *call = [notification object];
+    NSDictionary *data = [self callStatusPayloadForCall:call];
+    if (data == nil) return;
     [[NetworkController sharedInstance] sendMessage: @{@"event": @"ft-call-status-changed", @"data": data}];
 }
 
@@ -235,19 +286,49 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         if (transaction != nil) {
             [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction}];
         }
-    } else if ([event isEqualToString:@"leave-call"]) {
-        TUCall *call = [[TUCallCenter sharedInstance] callWithCallUUID:(data[@"callUUID"])];
-        
-        if ([call callStatus] != 1) {
+    } else if ([event isEqualToString:@"leave-call"] || [event isEqualToString:@"decline-call"]) {
+        NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        NSString *callUUID = BBExtractCallUUID(data);
+        TUCall *call = callUUID != nil ? [[TUCallCenter sharedInstance] callWithCallUUID:callUUID] : nil;
+        int status = call != nil ? [call callStatus] : 0;
+
+        if (call == nil || (status != 1 && status != 3 && status != 4)) {
             if (transaction != nil) {
-                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Call is not waiting to be left!"}];
+                [replyController sendMessage: @{
+                    @"transactionId": transaction,
+                    @"error": call == nil ? @"Call not found!" : @"Call is not active, dialing, or ringing!"
+                }];
             }
             return;
         }
-        
+
         [[TUCallCenter sharedInstance] disconnectCall:call];
         if (transaction != nil) {
-            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction}];
+            [replyController sendMessage: @{@"transactionId": transaction}];
+        }
+    } else if ([event isEqualToString:@"set-muted"]) {
+        NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        NSString *callUUID = BBExtractCallUUID(data);
+        TUCall *call = callUUID != nil ? [[TUCallCenter sharedInstance] callWithCallUUID:callUUID] : nil;
+        if (call == nil) {
+            if (transaction != nil) {
+                [replyController sendMessage: @{@"transactionId": transaction, @"error": @"Call not found!"}];
+            }
+            return;
+        }
+
+        id mutedVal = [data isKindOfClass:[NSDictionary class]] ? data[@"muted"] : nil;
+        if (mutedVal == nil || mutedVal == [NSNull null] || ![mutedVal respondsToSelector:@selector(boolValue)]) {
+            if (transaction != nil) {
+                [replyController sendMessage: @{@"transactionId": transaction, @"error": @"Missing muted flag!"}];
+            }
+            return;
+        }
+
+        BOOL muted = [mutedVal boolValue];
+        [call setUplinkMuted:muted];
+        if (transaction != nil) {
+            [replyController sendMessage: @{@"transactionId": transaction, @"muted": @(muted)}];
         }
     } else if ([event isEqualToString:@"generate-link"]) {
         if (data[@"callUUID"] != [NSNull null]) {
@@ -374,7 +455,89 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
             }
         }
     } else if ([event isEqualToString:@"start-call"]) {
-        
+        NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        id rawAddresses = [data isKindOfClass:[NSDictionary class]] ? data[@"addresses"] : nil;
+        NSMutableArray<TUHandle *> *handles = [NSMutableArray array];
+        if ([rawAddresses isKindOfClass:[NSArray class]]) {
+            for (id addr in (NSArray *)rawAddresses) {
+                if ([addr isKindOfClass:[NSString class]] && [(NSString *)addr length] > 0) {
+                    TUHandle *handle = [TUHandle handleWithDestinationID:addr];
+                    if (handle != nil) {
+                        [handles addObject:handle];
+                    }
+                }
+            }
+        }
+        if ([handles count] == 0) {
+            if (transaction != nil) {
+                [replyController sendMessage: @{@"transactionId": transaction, @"error": @"No valid addresses provided!"}];
+            }
+            return;
+        }
+
+        BOOL video = [data[@"video"] respondsToSelector:@selector(boolValue)] ? [data[@"video"] boolValue] : NO;
+        BOOL isTelephony = [data[@"isTelephony"] respondsToSelector:@selector(boolValue)] ? [data[@"isTelephony"] boolValue] : NO;
+
+        TUCallCenter *callCenter = [TUCallCenter sharedInstance];
+        TUCallProviderManager *providerManager = (TUCallProviderManager *)[callCenter providerManager];
+        if (providerManager == nil) {
+            Class pmClass = NSClassFromString(@"TUCallProviderManager");
+            providerManager = pmClass != Nil ? [[pmClass alloc] init] : nil;
+        }
+
+        TUCallProvider *provider = isTelephony ? [providerManager telephonyProvider] : [providerManager faceTimeProvider];
+        if (provider == nil) {
+            if (transaction != nil) {
+                [replyController sendMessage: @{@"transactionId": transaction, @"error": @"Requested call provider is unavailable!"}];
+            }
+            return;
+        }
+
+        Class dialReqClass = NSClassFromString(@"TUDialRequest");
+        TUDialRequest *request = dialReqClass != Nil ? [[dialReqClass alloc] initWithProvider:provider] : nil;
+        if (request == nil) {
+            if (transaction != nil) {
+                [replyController sendMessage: @{@"transactionId": transaction, @"error": @"TUDialRequest is unavailable!"}];
+            }
+            return;
+        }
+
+        if ([handles count] == 1) {
+            request.handle = [handles firstObject];
+        } else {
+            request.handles = [NSSet setWithArray:handles];
+        }
+        request.video = isTelephony ? NO : video;
+
+        if (![request isValid]) {
+            if (transaction != nil) {
+                [replyController sendMessage: @{@"transactionId": transaction, @"error": @"Invalid dial request!"}];
+            }
+            return;
+        }
+
+        void (^finishDial)(TUCall *, NSError *) = ^(TUCall *call, NSError *dialError) {
+            if (transaction == nil) return;
+            if (dialError != nil || call == nil) {
+                [replyController sendMessage: @{
+                    @"transactionId": transaction,
+                    @"error": dialError != nil ? ([dialError localizedDescription] ?: @"Failed to start call!") : @"Failed to start call!"
+                }];
+                return;
+            }
+            NSMutableDictionary *response = [([self callStatusPayloadForCall:call] ?: @{}) mutableCopy];
+            response[@"transactionId"] = transaction;
+            response[@"call_uuid"] = [call callUUID] ?: [NSNull null];
+            [replyController sendMessage:response];
+        };
+
+        if ([callCenter respondsToSelector:@selector(dialWithRequest:completionWithError:)]) {
+            [callCenter dialWithRequest:request completionWithError:finishDial];
+        } else {
+            [callCenter dialWithRequest:request completion:^(TUCall *call) {
+                finishDial(call, nil);
+            }];
+        }
     }
 }
 

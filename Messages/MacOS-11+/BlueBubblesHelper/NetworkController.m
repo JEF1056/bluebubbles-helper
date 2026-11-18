@@ -101,7 +101,7 @@ static os_log_t logger;
         @"message": @"Helper Connected!",
         @"process": [[NSBundle mainBundle] bundleIdentifier],
         // Actions added after the first release of the helper, so the server knows what it can ask for
-        @"capabilities": @[@"send-rich-link"],
+        @"capabilities": @[@"send-rich-link", @"get-pinned-chats", @"update-chat-pinned"],
     };
     [self sendMessage:message];
 }

@@ -26,6 +26,11 @@ typedef void (^FindMyLocationUpdateCallback)(id _Nullable location, id handle);
                                isFromGroup:(BOOL)isFromGroup
                             reverseGeocode:(BOOL)reverseGeocode
                                 completion:(FindMyCompletion)completion;
+- (void)stopRefreshingLocationForHandles:(NSArray *)locationHandles
+                                 priority:(long long)priority
+                              isFromGroup:(BOOL)isFromGroup
+                               completion:(FindMyCompletion)completion;
+- (void)stopRefreshingLocationWithCompletion:(FindMyCompletion)completion;
 - (void)startUpdatingFriendsWithInitialUpdates:(BOOL)includeInitialUpdates
                                     completion:(FindMyCompletion)completion;
 

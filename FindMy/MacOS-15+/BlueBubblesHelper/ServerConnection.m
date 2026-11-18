@@ -157,6 +157,10 @@ static os_log_t connectionLog;
         @"process": [[NSBundle mainBundle] bundleIdentifier] ?: BBFindMyBundleIdentifier,
     }];
     [self flushPendingMessages];
+    id helper = [FindMyHelper sharedInstance];
+    if ([helper respondsToSelector:@selector(handleServerRegistered)]) {
+        [helper handleServerRegistered];
+    }
 }
 
 - (void)socket:(GCDAsyncSocket *)socket didReadData:(NSData *)messageData withTag:(long)tag {
@@ -172,11 +176,19 @@ static os_log_t connectionLog;
     }
 
     NSString *action = [serverMessage[@"action"] isKindOfClass:[NSString class]] ? serverMessage[@"action"] : nil;
+    NSDictionary *data = [serverMessage[@"data"] isKindOfClass:[NSDictionary class]] ? serverMessage[@"data"] : nil;
     NSString *transactionIdentifier = [serverMessage[@"transactionId"] isKindOfClass:[NSString class]]
         ? serverMessage[@"transactionId"] : nil;
 
-    [[FindMyHelper sharedInstance] handleServerAction:action
-                               transactionIdentifier:transactionIdentifier];
+    id helper = [FindMyHelper sharedInstance];
+    if ([helper respondsToSelector:@selector(handleServerAction:data:transactionIdentifier:)]) {
+        [helper handleServerAction:action
+                              data:data
+             transactionIdentifier:transactionIdentifier];
+    } else {
+        [helper handleServerAction:action
+             transactionIdentifier:transactionIdentifier];
+    }
 }
 
 - (void)socketDidDisconnect:(GCDAsyncSocket *)socket withError:(nullable NSError *)error {

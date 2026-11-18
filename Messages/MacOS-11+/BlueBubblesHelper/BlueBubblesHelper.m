@@ -162,6 +162,17 @@ static void SendTransactionResponse(NSString *transaction, NSDictionary *extra) 
             
             networkController = [NetworkController sharedInstance];
             [networkController connect];
+
+            [[NSNotificationCenter defaultCenter] addObserverForName:@"IMPinnedConversationsDidChangeNotification"
+                                                              object:nil
+                                                               queue:[NSOperationQueue mainQueue]
+                                                          usingBlock:^(NSNotification * _Nonnull note) {
+                NSArray<NSString *> *pinnedChatGuids = [[BlueBubblesHelper sharedInstance] getPinnedChatGuids];
+                [[NetworkController sharedInstance] sendMessage:@{
+                    @"event": @"pinned-chats-updated",
+                    @"pinnedChatGuids": pinnedChatGuids
+                }];
+            }];
             
 //            NSArray* aliases = @[@"tanay@neotia.in", @"zshames2@icloud.com", @"bluebubblesapp@gmail.com", @"hijoelj@gmail.com"];
 //            CKConversation* convo = [CKConversation conversationForAddresses:aliases allowRetargeting:TRUE candidateConversation:nil];
@@ -178,6 +189,34 @@ static void SendTransactionResponse(NSString *transaction, NSDictionary *extra) 
         os_log_error(logger,  "Injected into non-iMessage process %@, aborting.", [[NSBundle mainBundle] bundleIdentifier]);
         return;
     }
+}
+
+#pragma mark - Pinned Chats
+
+- (NSArray<NSString *> *)getPinnedChatGuids {
+    IMPinnedConversationsController *controller = [IMPinnedConversationsController sharedInstance];
+    NSOrderedSet *identifierSet = [controller pinnedConversationIdentifierSet];
+    if (identifierSet == nil || identifierSet.count == 0) {
+        return @[];
+    }
+
+    IMChatRegistry *registry = [IMChatRegistry sharedInstance];
+    NSMutableArray<NSString *> *guids = [NSMutableArray arrayWithCapacity:identifierSet.count];
+    for (id identifier in identifierSet) {
+        if (![identifier isKindOfClass:[NSString class]]) {
+            continue;
+        }
+        NSString *pinningId = (NSString *)identifier;
+        NSString *resolvedGuid = nil;
+        if ([registry respondsToSelector:@selector(existingChatWithPinningIdentifier:)]) {
+            IMChat *chat = [registry existingChatWithPinningIdentifier:pinningId];
+            if (chat != nil && chat.guid != nil) {
+                resolvedGuid = chat.guid;
+            }
+        }
+        [guids addObject:(resolvedGuid != nil ? resolvedGuid : pinningId)];
+    }
+    return [guids copy];
 }
 
 #pragma mark - Find Chat Objects
@@ -327,6 +366,9 @@ static void SendTransactionResponse(NSString *transaction, NSDictionary *extra) 
 }
 
 -(void) handleServerEvent: (NSString*)event data: (NSDictionary*)data transactionId: (NSString*)transaction {
+    if (![data isKindOfClass:[NSDictionary class]]) {
+        data = @{};
+    }
     NSString *chatGuid = data[@"chatGuid"];
     
     if ([event isEqualToString:@"start-typing"]) {
@@ -447,24 +489,36 @@ static void SendTransactionResponse(NSString *transaction, NSDictionary *extra) 
         if (transaction != nil) {
             SendTransactionResponse(transaction, nil);
         }
-    // If the server tells us to mark a chat as read
+    } else if ([event isEqualToString:@"get-pinned-chats"]) {
+        SendTransactionResponse(transaction, @{@"pinnedChatGuids": [self getPinnedChatGuids]});
     } else if ([event isEqualToString:@"update-chat-pinned"]) {
         IMChat *chat = [self getIMChatFromGuid: data[@"chatGuid"] transaction: transaction];
-        if (!chat.isPinned) {
-            NSArray* arr = [[[IMPinnedConversationsController sharedInstance] pinnedConversationIdentifierSet] array];
-            NSMutableArray<NSString*>* chatArr = [[NSMutableArray alloc] initWithArray:(arr)];
-            [chatArr addObject:(chat.pinningIdentifier)];
-            NSArray<NSString*>* finalArr = [chatArr copy];
-            IMPinnedConversationsController* controller = [IMPinnedConversationsController sharedInstance];
-            [controller setPinnedConversationIdentifiers:(finalArr) withUpdateReason:(@"contextMenu")];
-        } else {
-            NSArray* arr = [[[IMPinnedConversationsController sharedInstance] pinnedConversationIdentifierSet] array];
-            NSMutableArray<NSString*>* chatArr = [[NSMutableArray alloc] initWithArray:(arr)];
-            [chatArr removeObject:(chat.pinningIdentifier)];
-            NSArray<NSString*>* finalArr = [chatArr copy];
-            IMPinnedConversationsController* controller = [IMPinnedConversationsController sharedInstance];
-            [controller setPinnedConversationIdentifiers:(finalArr) withUpdateReason:(@"contextMenu")];
+        if (chat == nil) {
+            return;
         }
+        BOOL shouldPin = (data[@"pinned"] != nil && data[@"pinned"] != [NSNull null])
+            ? [data[@"pinned"] boolValue]
+            : !chat.isPinned;
+        IMPinnedConversationsController *controller = [IMPinnedConversationsController sharedInstance];
+        NSArray *arr = [[controller pinnedConversationIdentifierSet] array];
+        NSMutableArray<NSString *> *chatArr = arr != nil ? [arr mutableCopy] : [NSMutableArray array];
+        NSString *pinningId = chat.pinningIdentifier;
+        if (pinningId == nil) {
+            SendTransactionResponse(transaction, @{@"error": @"Chat does not have a pinningIdentifier!"});
+            return;
+        }
+        if (shouldPin) {
+            if (![chatArr containsObject:pinningId]) {
+                [chatArr addObject:pinningId];
+                [controller setPinnedConversationIdentifiers:[chatArr copy] withUpdateReason:@"contextMenu"];
+            }
+        } else {
+            if ([chatArr containsObject:pinningId]) {
+                [chatArr removeObject:pinningId];
+                [controller setPinnedConversationIdentifiers:[chatArr copy] withUpdateReason:@"contextMenu"];
+            }
+        }
+        SendTransactionResponse(transaction, @{@"pinnedChatGuids": [self getPinnedChatGuids]});
     // If the server tells us to create a chat
     } else if ([event isEqualToString:@"create-chat"]) {
         NSMutableArray<IMHandle*> *handles = [[NSMutableArray alloc] initWithArray:(@[])];
@@ -1492,6 +1546,7 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
 
     if (data[@"selectedMessageGuid"] != [NSNull null] && [data[@"selectedMessageGuid"] length] != 0) {
         [BlueBubblesHelper getMessageItem:(chat) :(data[@"selectedMessageGuid"]) completionBlock:^(IMMessage *message) {
+            NSInteger partIndex = (data[@"partIndex"] != nil && data[@"partIndex"] != [NSNull null]) ? [data[@"partIndex"] integerValue] : 0;
             IMMessageItem *messageItem = (IMMessageItem *)message._imMessageItem;
             NSObject *items = messageItem._newChatItems;
             IMMessagePartChatItem *item;
@@ -1504,7 +1559,7 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
                     if ([[NSProcessInfo processInfo] operatingSystemVersion].majorVersion > 11 && cls != nil && [i isKindOfClass:cls]) {
                         IMAggregateAttachmentMessagePartChatItem *aggregate = (IMAggregateAttachmentMessagePartChatItem *)i;
                         for (IMMessagePartChatItem *i2 in [aggregate aggregateAttachmentParts]) {
-                            if ([i2 index] == [data[@"partIndex"] integerValue]) {
+                            if ([i2 index] == partIndex) {
                                 item = i2;
                                 break;
                             }
@@ -1516,7 +1571,7 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
                         // "unrecognized selector" and aborts Messages. Skip anything that isn't a
                         // message-part item.
                         IMMessagePartChatItem *mpi = (IMMessagePartChatItem *)i;
-                        if ([mpi index] == [data[@"partIndex"] integerValue]) {
+                        if ([mpi index] == partIndex) {
                             item = mpi;
                             break;
                         }
@@ -1537,39 +1592,40 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
                     if (text == nil) {
                         text = [message text];
                     }
-                    messageSummary = @{@"amc":@1,@"ams":text.string};
+                    messageSummary = @{@"amc":@1,@"ams":text.string ?: @""};
                     // Send the tapback
                     // check if the body happens to be an object (ie an attachment) and send the tapback accordingly to show the proper summary
                     NSData *dataenc = [text.string dataUsingEncoding:NSNonLossyASCIIStringEncoding];
                     NSString *encodevalue = [[NSString alloc]initWithData:dataenc encoding:NSUTF8StringEncoding];
                     if ([encodevalue isEqualToString:@"\\ufffc"]) {
                         NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:(@"an attachment")]];
-                        createMessage(newAttributedString, subjectAttributedString, effectId, nil, [NSString stringWithFormat:@"p:%@/%@", data[@"partIndex"], [message guid]], &reactionLong, [item messagePartRange], @{}, nil, false, ddScan);
+                        createMessage(newAttributedString, subjectAttributedString, effectId, nil, [NSString stringWithFormat:@"p:%@/%@", @(partIndex), [message guid]], &reactionLong, [item messagePartRange], @{}, nil, false, ddScan);
                     } else {
-                        NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:([NSString stringWithFormat:(@"“%@”"), text.string])]];
+                        NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:([NSString stringWithFormat:(@"“%@”"), text.string ?: @""])]];
                         if ([item text] == nil) {
                             createMessage(newAttributedString, subjectAttributedString, effectId, nil, [NSString stringWithFormat:@"bp:%@", [message guid]], &reactionLong, [item messagePartRange], messageSummary, nil, false, ddScan);
                         } else {
-                            createMessage(newAttributedString, subjectAttributedString, effectId, nil, [NSString stringWithFormat:@"p:%@/%@", data[@"partIndex"], [message guid]], &reactionLong, [item messagePartRange], messageSummary, nil, false, ddScan);
+                            createMessage(newAttributedString, subjectAttributedString, effectId, nil, [NSString stringWithFormat:@"p:%@/%@", @(partIndex), [message guid]], &reactionLong, [item messagePartRange], messageSummary, nil, false, ddScan);
                         }
                     }
                 } else {
-                    messageSummary = @{@"amc":@1,@"ams":message.text.string};
+                    NSString *fallbackText = [message text].string ?: @"";
+                    messageSummary = @{@"amc":@1,@"ams":fallbackText};
                     // Send the tapback
                     // check if the body happens to be an object (ie an attachment) and send the tapback accordingly to show the proper summary
-                    NSData *dataenc = [[message text].string dataUsingEncoding:NSNonLossyASCIIStringEncoding];
+                    NSData *dataenc = [fallbackText dataUsingEncoding:NSNonLossyASCIIStringEncoding];
                     NSString *encodevalue = [[NSString alloc]initWithData:dataenc encoding:NSUTF8StringEncoding];
-                    NSRange range = NSMakeRange(0, [message text].string.length);
+                    NSRange range = NSMakeRange(0, fallbackText.length);
                     if ([encodevalue isEqualToString:@"\\ufffc"] || [encodevalue length] == 0) {
                         NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:(@"an attachment")]];
                         createMessage(newAttributedString, subjectAttributedString, effectId, nil, [message guid], &reactionLong, range, @{}, nil, false, ddScan);
                     } else {
-                        NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:([NSString stringWithFormat:(@"“%@”"), [message text].string])]];
+                        NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:([NSString stringWithFormat:(@"“%@”"), fallbackText])]];
                         createMessage(newAttributedString, subjectAttributedString, effectId, nil, [message guid], &reactionLong, range, messageSummary, nil, false, ddScan);
                     }
                 }
             } else {
-                NSString *identifier = @"";
+                NSString *identifier = nil;
                 // either reply to an existing thread or create a new thread
                 if (message.threadIdentifier != nil) {
                     identifier = message.threadIdentifier;
@@ -1580,6 +1636,7 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
                     // If we don't have a real message-part item, just send without threading.
                     identifier = IMCreateThreadIdentifierForMessagePartChatItem(item);
                 }
+                if (identifier.length == 0) identifier = nil;
                 createMessage(attributedString, subjectAttributedString, effectId, identifier, nil, nil, NSMakeRange(0, 0), nil, transfers, isAudioMessage, ddScan);
             }
         }];

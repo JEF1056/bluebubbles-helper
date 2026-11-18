@@ -9,6 +9,10 @@ NS_ASSUME_NONNULL_BEGIN
 + (nullable NSDictionary *)locationPayloadForLocation:(nullable id)location
                                                 handle:(nullable id)handle;
 
++ (nullable NSDictionary *)locationPayloadForLocation:(nullable id)location
+                                                handle:(nullable id)handle
+                                  isLocatingInProgress:(nullable NSNumber *)isLocatingOverride;
+
 + (NSDictionary *)responseForTransactionIdentifier:(nullable NSString *)transactionIdentifier
                        locationsByFriendIdentifier:(NSDictionary<NSString *, NSDictionary *> *)locationsByFriendIdentifier
                           pendingFriendIdentifiers:(NSSet<NSString *> *)pendingFriendIdentifiers

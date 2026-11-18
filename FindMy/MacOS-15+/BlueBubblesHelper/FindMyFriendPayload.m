@@ -78,11 +78,112 @@
     return [self nonEmptyString:[self valueForSelector:comparisonIdentifierSelector onObject:handle]];
 }
 
++ (nullable NSNumber *)boolValueForSelector:(SEL)selector onObject:(nullable id)object {
+    if (object == nil || ![object respondsToSelector:selector]) {
+        return nil;
+    }
+
+    NSMethodSignature *signature = [object methodSignatureForSelector:selector];
+    if (signature == nil || signature.numberOfArguments != 2) {
+        return nil;
+    }
+
+    const char *returnType = [signature methodReturnType];
+    if (returnType == NULL || (returnType[0] != 'B' && returnType[0] != 'c')) {
+        return nil;
+    }
+
+    BOOL result = NO;
+    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+    [invocation setTarget:object];
+    [invocation setSelector:selector];
+    [invocation invoke];
+    [invocation getReturnValue:&result];
+    return @(result);
+}
+
++ (BOOL)isLocatingInProgressForLocation:(nullable id)location
+                                 handle:(nullable id)handle
+                     isLocatingOverride:(nullable NSNumber *)isLocatingOverride {
+    if (isLocatingOverride != nil) {
+        return [isLocatingOverride boolValue];
+    }
+
+    NSArray<NSString *> *positiveSelectors = @[@"isLocatingInProgress", @"locatingInProgress", @"isLocating"];
+    for (id target in @[location ?: [NSNull null], handle ?: [NSNull null]]) {
+        if (target == [NSNull null]) {
+            continue;
+        }
+        for (NSString *selectorName in positiveSelectors) {
+            NSNumber *value = [self boolValueForSelector:NSSelectorFromString(selectorName) onObject:target];
+            if (value != nil) {
+                return [value boolValue];
+            }
+        }
+    }
+
+    NSNumber *locationFinished = [self boolValueForSelector:NSSelectorFromString(@"locationFinished") onObject:location];
+    if (locationFinished != nil) {
+        return ![locationFinished boolValue];
+    }
+
+    return NO;
+}
+
 + (nullable NSDictionary *)locationPayloadForLocation:(nullable id)location handle:(nullable id)handle {
+    return [self locationPayloadForLocation:location handle:handle isLocatingInProgress:nil];
+}
+
++ (nullable NSString *)shortAddressFromPlaceMark:(nullable id)placeMark {
+    if (placeMark == nil) {
+        return nil;
+    }
+    NSString *locality = [self nonEmptyString:[self valueForSelector:NSSelectorFromString(@"locality") onObject:placeMark]];
+    NSString *state = [self nonEmptyString:[self valueForSelector:NSSelectorFromString(@"stateCode") onObject:placeMark]]
+        ?: [self nonEmptyString:[self valueForSelector:NSSelectorFromString(@"administrativeArea") onObject:placeMark]];
+    if (locality != nil && state != nil) {
+        return [NSString stringWithFormat:@"%@, %@", locality, state];
+    }
+    return locality ?: state;
+}
+
++ (nullable NSString *)longAddressFromPlaceMark:(nullable id)placeMark {
+    if (placeMark == nil) {
+        return nil;
+    }
+    id formattedLines = [self valueForSelector:NSSelectorFromString(@"formattedAddressLines") onObject:placeMark];
+    if ([formattedLines isKindOfClass:[NSArray class]]) {
+        NSMutableArray<NSString *> *parts = [[NSMutableArray alloc] init];
+        for (id line in (NSArray *)formattedLines) {
+            NSString *cleanLine = [self nonEmptyString:line];
+            if (cleanLine != nil) {
+                [parts addObject:cleanLine];
+            }
+        }
+        if (parts.count > 0) {
+            return [parts componentsJoinedByString:@", "];
+        }
+    }
+    NSString *street = [self nonEmptyString:[self valueForSelector:NSSelectorFromString(@"streetAddress") onObject:placeMark]]
+        ?: [self nonEmptyString:[self valueForSelector:NSSelectorFromString(@"streetName") onObject:placeMark]];
+    NSString *shortLocality = [self shortAddressFromPlaceMark:placeMark];
+    if (street != nil && shortLocality != nil) {
+        return [NSString stringWithFormat:@"%@, %@", street, shortLocality];
+    }
+    return street ?: shortLocality;
+}
+
++ (nullable NSDictionary *)locationPayloadForLocation:(nullable id)location
+                                                handle:(nullable id)handle
+                                  isLocatingInProgress:(nullable NSNumber *)isLocatingOverride {
     NSString *friendIdentifier = [self identifierForHandle:handle];
     if (friendIdentifier == nil) {
         return nil;
     }
+
+    BOOL isLocatingInProgress = [self isLocatingInProgressForLocation:location
+                                                               handle:handle
+                                                   isLocatingOverride:isLocatingOverride];
 
     if (location == nil) {
         return @{
@@ -93,7 +194,7 @@
             @"subtitle": [NSNull null],
             @"title": [NSNull null],
             @"last_updated": [NSNull null],
-            @"is_locating_in_progress": @NO,
+            @"is_locating_in_progress": @(isLocatingInProgress),
             @"status": @"legacy",
             @"location_type": [NSNull null],
             @"horizontal_accuracy": [NSNull null],
@@ -119,21 +220,25 @@
         ? [findMyLocation timestamp] : 0;
     BOOL providesLocationType = [findMyLocation respondsToSelector:@selector(locationType)];
     long long locationType = providesLocationType ? [findMyLocation locationType] : 0;
+    id placeMark = [self valueForSelector:NSSelectorFromString(@"address") onObject:findMyLocation];
     NSString *coarseAddress = [self nonEmptyString:
         [self valueForSelector:@selector(coarseAddressLabel) onObject:findMyLocation]];
+    NSString *longAddress = [self longAddressFromPlaceMark:placeMark] ?: coarseAddress;
+    NSString *shortAddress = coarseAddress ?: [self shortAddressFromPlaceMark:placeMark] ?: longAddress;
+    NSString *subtitle = shortAddress ?: longAddress;
     NSString *firstLocationLabel = [self firstStringInArray:
         [self valueForSelector:@selector(labels) onObject:findMyLocation]];
 
     return @{
         @"handle": friendIdentifier,
         @"coordinates": coordinates,
-        @"long_address": coarseAddress ?: [NSNull null],
-        @"short_address": coarseAddress ?: [NSNull null],
-        @"subtitle": coarseAddress ?: [NSNull null],
+        @"long_address": longAddress ?: [NSNull null],
+        @"short_address": shortAddress ?: [NSNull null],
+        @"subtitle": subtitle ?: [NSNull null],
         @"title": firstLocationLabel ?: [NSNull null],
         @"last_updated": timestampSeconds > 0 && isfinite(timestampSeconds)
             ? @(llround(timestampSeconds * 1000.0)) : [NSNull null],
-        @"is_locating_in_progress": @NO,
+        @"is_locating_in_progress": @(isLocatingInProgress),
         @"status": [self statusForLocationType:locationType],
         @"location_type": providesLocationType ? @(locationType) : [NSNull null],
         @"horizontal_accuracy": [findMyLocation respondsToSelector:@selector(horizontalAccuracy)]
@@ -159,6 +264,12 @@
     for (NSString *friendIdentifier in sortedFriendIdentifiers) {
         NSDictionary *locationPayload = locationsByFriendIdentifier[friendIdentifier];
         if (locationPayload != nil) {
+            if ([pendingFriendIdentifiers containsObject:friendIdentifier] &&
+                ![locationPayload[@"is_locating_in_progress"] isEqual:@YES]) {
+                NSMutableDictionary *mutablePayload = [locationPayload mutableCopy];
+                mutablePayload[@"is_locating_in_progress"] = @YES;
+                locationPayload = mutablePayload;
+            }
             [orderedLocations addObject:locationPayload];
         }
     }

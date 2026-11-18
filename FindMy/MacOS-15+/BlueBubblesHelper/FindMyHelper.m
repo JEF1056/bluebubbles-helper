@@ -15,14 +15,33 @@ static const NSTimeInterval BBFriendListTimeoutSeconds = 5.0;
 static const NSTimeInterval BBLocationRefreshTimeoutSeconds = 8.0;
 static const NSTimeInterval BBDevicesDataSourceTimeoutSeconds = 5.0;
 static const NSTimeInterval BBDevicesDataSourcePollIntervalSeconds = 0.1;
-static const long long BBLiveLocationRefreshPriority = 1000;
+// FindMyLocate.LocatePriority raw values: 0=backgroundAppRefresh, 1=shallow, 2=live, 3=backgroundProactive.
+static const long long BBShallowLocationRefreshPriority = 1;
+static const long long BBLiveLocationRefreshPriority = 2;
+
+@protocol BBFindMyLocationType <NSObject>
+- (long long)locationType;
+@end
 
 @interface FindMyHelper ()
 @property(nonatomic, strong, nullable) FindMyLocateSession *activeLocateSession;
 @property(nonatomic, strong) NSMutableSet<FindMyFriendsRefreshCoordinator *> *activeFriendRefreshes;
 @property(nonatomic, strong) NSMutableSet<FindMyDevicesRefreshCoordinator *> *activeDeviceRefreshes;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *inFlightRefreshHandleCounts;
+@property(nonatomic) BOOL friendStreamingStarted;
+@property(nonatomic, copy, nullable) NSString *activeLiveNormalizedIdentifier;
+@property(nonatomic, copy, nullable) NSString *pendingLiveNormalizedIdentifier;
+@property(nonatomic, strong, nullable) id activeLiveHandleObject;
+@property(nonatomic) NSUInteger liveSessionGeneration;
 - (nullable FindMyLocateSession *)locateSession;
-- (void)handleFriendsRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier;
+- (void)startStreamingLocationsForAllFriends:(FindMyLocateSession *)session
+                               focusedHandle:(nullable NSString *)focusedHandle;
+- (void)handleFriendsRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier
+                                                data:(nullable NSDictionary *)data;
+- (void)handleStartLiveLocationForTransactionIdentifier:(nullable NSString *)transactionIdentifier
+                                                   data:(nullable NSDictionary *)data;
+- (void)handleStopLiveLocationForTransactionIdentifier:(nullable NSString *)transactionIdentifier
+                                                  data:(nullable NSDictionary *)data;
 - (void)handleDevicesRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier;
 - (void)sendError:(NSString *)errorMessage transactionIdentifier:(nullable NSString *)transactionIdentifier;
 @end
@@ -36,6 +55,7 @@ static os_log_t helperLog;
     if (self != nil) {
         _activeFriendRefreshes = [[NSMutableSet alloc] init];
         _activeDeviceRefreshes = [[NSMutableSet alloc] init];
+        _inFlightRefreshHandleCounts = [[NSMutableDictionary alloc] init];
     }
     return self;
 }
@@ -82,8 +102,24 @@ static os_log_t helperLog;
 
 - (void)handleServerAction:(nullable NSString *)action
      transactionIdentifier:(nullable NSString *)transactionIdentifier {
+    [self handleServerAction:action data:nil transactionIdentifier:transactionIdentifier];
+}
+
+- (void)handleServerAction:(nullable NSString *)action
+                      data:(nullable NSDictionary *)data
+     transactionIdentifier:(nullable NSString *)transactionIdentifier {
     if ([action isEqualToString:@"refresh-findmy-friends"]) {
-        [self handleFriendsRefreshForTransactionIdentifier:transactionIdentifier];
+        [self handleFriendsRefreshForTransactionIdentifier:transactionIdentifier data:data];
+        return;
+    }
+
+    if ([action isEqualToString:@"start-findmy-live-location"]) {
+        [self handleStartLiveLocationForTransactionIdentifier:transactionIdentifier data:data];
+        return;
+    }
+
+    if ([action isEqualToString:@"stop-findmy-live-location"]) {
+        [self handleStopLiveLocationForTransactionIdentifier:transactionIdentifier data:data];
         return;
     }
 
@@ -105,6 +141,17 @@ static os_log_t helperLog;
 
     NSString *errorMessage = [NSString stringWithFormat:@"Find My action not implemented: %@", action];
     [self sendError:errorMessage transactionIdentifier:transactionIdentifier];
+}
+
+- (void)handleServerRegistered {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        FindMyLocateSession *session = [self locateSession];
+        if (session == nil || self.friendStreamingStarted) {
+            return;
+        }
+        self.friendStreamingStarted = YES;
+        [self startStreamingLocationsForAllFriends:session focusedHandle:nil];
+    });
 }
 
 - (void)sendError:(NSString *)errorMessage transactionIdentifier:(nullable NSString *)transactionIdentifier {
@@ -142,8 +189,28 @@ static os_log_t helperLog;
     self.activeLocateSession = [[locateSessionClass alloc] init];
 
     if ([self.activeLocateSession respondsToSelector:@selector(setLocationUpdateCallback:)]) {
+        __weak typeof(self) weakSelf = self;
         [self.activeLocateSession setLocationUpdateCallback:^(id _Nullable location, id handle) {
-            NSDictionary *locationPayload = [FindMyFriendPayload locationPayloadForLocation:location handle:handle];
+            FindMyHelper *strongSelf = weakSelf;
+            NSString *handleIdentifier = [FindMyFriendPayload identifierForHandle:handle];
+            BOOL isLiveLocation = location != nil &&
+                [location respondsToSelector:@selector(locationType)] &&
+                [(id<BBFindMyLocationType>)location locationType] == 2;
+            NSNumber *isLocatingOverride = nil;
+            if (strongSelf != nil && handleIdentifier != nil) {
+                NSString *normalizedIdentifier = handleIdentifier.lowercaseString;
+                @synchronized (strongSelf.inFlightRefreshHandleCounts) {
+                    if (isLiveLocation) {
+                        [strongSelf.inFlightRefreshHandleCounts removeObjectForKey:normalizedIdentifier];
+                        isLocatingOverride = @NO;
+                    } else if ([strongSelf.inFlightRefreshHandleCounts[normalizedIdentifier] integerValue] > 0) {
+                        isLocatingOverride = @YES;
+                    }
+                }
+            }
+            NSDictionary *locationPayload = [FindMyFriendPayload locationPayloadForLocation:location
+                                                                                     handle:handle
+                                                                       isLocatingInProgress:isLocatingOverride];
             if (locationPayload == nil) {
                 return;
             }
@@ -159,8 +226,17 @@ static os_log_t helperLog;
     }
 
     if ([self.activeLocateSession respondsToSelector:@selector(startUpdatingFriendsWithInitialUpdates:completion:)]) {
+        __weak typeof(self) weakSelf = self;
         [self.activeLocateSession startUpdatingFriendsWithInitialUpdates:YES completion:^{
             os_log(helperLog, "Find My friend updates started");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                FindMyHelper *strongSelf = weakSelf;
+                if (strongSelf == nil || strongSelf.activeLocateSession == nil || strongSelf.friendStreamingStarted) {
+                    return;
+                }
+                strongSelf.friendStreamingStarted = YES;
+                [strongSelf startStreamingLocationsForAllFriends:strongSelf.activeLocateSession focusedHandle:nil];
+            });
         }];
     }
 
@@ -174,11 +250,38 @@ static os_log_t helperLog;
 }
 
 - (void)startStreamingLocationsForAllFriends:(FindMyLocateSession *)session {
+    [self startStreamingLocationsForAllFriends:session focusedHandle:nil];
+}
+
+- (void)startStreamingLocationsForAllFriends:(FindMyLocateSession *)session
+                               focusedHandle:(nullable NSString *)focusedHandle {
+    NSString *trimmedFocus = [focusedHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *normalizedFocus = trimmedFocus.length > 0 ? trimmedFocus : self.activeLiveNormalizedIdentifier;
+
+    void (^startHandles)(NSArray *, long long) = ^(NSArray *handles, long long priority) {
+        if (handles.count == 0) {
+            return;
+        }
+        if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:reverseGeocode:completion:)]) {
+            [session startRefreshingLocationForHandles:handles
+                                              priority:priority
+                                           isFromGroup:NO
+                                        reverseGeocode:YES
+                                            completion:^{}];
+        } else if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
+            [session startRefreshingLocationForHandles:handles
+                                              priority:priority
+                                           isFromGroup:NO
+                                            completion:^{}];
+        }
+    };
+
     void (^refreshHandles)(NSArray * _Nullable) = ^(NSArray * _Nullable friendRecords) {
         if (![friendRecords isKindOfClass:[NSArray class]] || friendRecords.count == 0) {
             return;
         }
-        NSMutableArray *handles = [[NSMutableArray alloc] initWithCapacity:friendRecords.count];
+        NSMutableArray *focusedHandles = [[NSMutableArray alloc] init];
+        NSMutableArray *remainingHandles = [[NSMutableArray alloc] initWithCapacity:friendRecords.count];
         SEL handleSelector = NSSelectorFromString(@"handle");
         for (id friendRecord in friendRecords) {
             id handle = friendRecord;
@@ -191,25 +294,17 @@ static os_log_t helperLog;
                     handle = extracted;
                 }
             }
-            if (handle != nil && [FindMyFriendPayload identifierForHandle:handle] != nil) {
-                [handles addObject:handle];
+            NSString *identifier = [FindMyFriendPayload identifierForHandle:handle];
+            if (handle != nil && identifier != nil) {
+                if (normalizedFocus != nil && [identifier caseInsensitiveCompare:normalizedFocus] == NSOrderedSame) {
+                    [focusedHandles addObject:handle];
+                } else {
+                    [remainingHandles addObject:handle];
+                }
             }
         }
-        if (handles.count == 0) {
-            return;
-        }
-        if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:reverseGeocode:completion:)]) {
-            [session startRefreshingLocationForHandles:handles
-                                              priority:BBLiveLocationRefreshPriority
-                                           isFromGroup:NO
-                                        reverseGeocode:YES
-                                            completion:^{}];
-        } else if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
-            [session startRefreshingLocationForHandles:handles
-                                              priority:BBLiveLocationRefreshPriority
-                                           isFromGroup:NO
-                                            completion:^{}];
-        }
+        startHandles(focusedHandles, BBLiveLocationRefreshPriority);
+        startHandles(remainingHandles, BBShallowLocationRefreshPriority);
     };
 
     if ([session respondsToSelector:@selector(getFriendsSharingLocationsWithMeWithCompletion:)]) {
@@ -223,11 +318,293 @@ static os_log_t helperLog;
     }
 }
 
-- (void)handleFriendsRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier {
+- (nullable id)extractHandleFromFriendRecord:(id)friendRecord {
+    SEL handleSelector = NSSelectorFromString(@"handle");
+    if ([friendRecord respondsToSelector:handleSelector]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id extracted = [friendRecord performSelector:handleSelector];
+#pragma clang diagnostic pop
+        if (extracted != nil) {
+            return extracted;
+        }
+    }
+    return friendRecord;
+}
+
+- (nullable id)findHandleObjectForIdentifier:(NSString *)identifier inFriendRecords:(nullable NSArray *)friendRecords {
+    if (![friendRecords isKindOfClass:[NSArray class]]) {
+        return nil;
+    }
+    for (id friendRecord in friendRecords) {
+        id handle = [self extractHandleFromFriendRecord:friendRecord];
+        NSString *candidate = [FindMyFriendPayload identifierForHandle:handle];
+        if (candidate != nil && [candidate caseInsensitiveCompare:identifier] == NSOrderedSame) {
+            return handle;
+        }
+    }
+    return nil;
+}
+
+- (void)resolveHandleObjectForIdentifier:(NSString *)identifier
+                                 session:(FindMyLocateSession *)session
+                              completion:(void (^)(id _Nullable handleObject))completion {
+    NSArray *cachedFriends = nil;
+    if ([session respondsToSelector:@selector(cachedFriendsSharingLocationsWithMe)]) {
+        cachedFriends = [session cachedFriendsSharingLocationsWithMe];
+    } else if ([session respondsToSelector:@selector(cachedFriendsSharingLocationWithMe)]) {
+        cachedFriends = [session cachedFriendsSharingLocationWithMe];
+    }
+    id cachedHandle = [self findHandleObjectForIdentifier:identifier inFriendRecords:cachedFriends];
+    if (cachedHandle != nil) {
+        completion(cachedHandle);
+        return;
+    }
+
+    if ([session respondsToSelector:@selector(getFriendsSharingLocationsWithMeWithCompletion:)]) {
+        [session getFriendsSharingLocationsWithMeWithCompletion:^(NSArray * _Nullable friendRecords) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion([self findHandleObjectForIdentifier:identifier inFriendRecords:friendRecords]);
+            });
+        }];
+        return;
+    }
+
+    completion(nil);
+}
+
+- (nullable id)cachedLocationForHandle:(id)handle session:(FindMyLocateSession *)session {
+    if ([session respondsToSelector:@selector(cachedLocationForHandle:includeAddress:)]) {
+        return [session cachedLocationForHandle:handle includeAddress:YES];
+    }
+    if ([session respondsToSelector:@selector(cachedLocationForHandle:)]) {
+        return [session cachedLocationForHandle:handle];
+    }
+    return nil;
+}
+
+- (void)stopLiveRefreshForHandleObject:(id)handleObject
+                  normalizedIdentifier:(nullable NSString *)normalizedIdentifier
+                               session:(nullable FindMyLocateSession *)session {
+    if (normalizedIdentifier != nil) {
+        @synchronized (self.inFlightRefreshHandleCounts) {
+            [self.inFlightRefreshHandleCounts removeObjectForKey:normalizedIdentifier];
+        }
+    }
+    if (handleObject == nil || session == nil) {
+        return;
+    }
+    if ([session respondsToSelector:@selector(stopRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
+        [session stopRefreshingLocationForHandles:@[handleObject]
+                                         priority:BBLiveLocationRefreshPriority
+                                      isFromGroup:NO
+                                       completion:^{
+            os_log(helperLog, "Stopped Find My live refresh for %{public}@", normalizedIdentifier ?: @"handle");
+        }];
+    }
+}
+
+- (void)handleStartLiveLocationForTransactionIdentifier:(nullable NSString *)transactionIdentifier
+                                                   data:(nullable NSDictionary *)data {
+    NSString *rawHandle = [data[@"handle"] isKindOfClass:[NSString class]] ? data[@"handle"] : nil;
+    if (rawHandle == nil && [data[@"handles"] isKindOfClass:[NSArray class]]) {
+        id first = [(NSArray *)data[@"handles"] firstObject];
+        if ([first isKindOfClass:[NSString class]]) {
+            rawHandle = first;
+        }
+    }
+    NSString *trimmedHandle = [rawHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmedHandle.length == 0) {
+        [self sendError:@"Missing handle for start-findmy-live-location" transactionIdentifier:transactionIdentifier];
+        return;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        FindMyLocateSession *session = [self locateSession];
+        if (session == nil) {
+            [self sendError:@"FindMyLocateSession is unavailable" transactionIdentifier:transactionIdentifier];
+            return;
+        }
+
+        self.liveSessionGeneration += 1;
+        NSUInteger sessionGen = self.liveSessionGeneration;
+        NSString *normalizedTarget = trimmedHandle.lowercaseString;
+        self.pendingLiveNormalizedIdentifier = normalizedTarget;
+
+        if (self.activeLiveHandleObject != nil &&
+            self.activeLiveNormalizedIdentifier != nil &&
+            ![self.activeLiveNormalizedIdentifier isEqualToString:normalizedTarget]) {
+            id priorHandle = self.activeLiveHandleObject;
+            NSString *priorIdentifier = self.activeLiveNormalizedIdentifier;
+            self.activeLiveHandleObject = nil;
+            self.activeLiveNormalizedIdentifier = nil;
+            [self stopLiveRefreshForHandleObject:priorHandle normalizedIdentifier:priorIdentifier session:session];
+        }
+
+        __weak typeof(self) weakSelf = self;
+        [self resolveHandleObjectForIdentifier:trimmedHandle
+                                       session:session
+                                    completion:^(id _Nullable targetHandleObject) {
+            FindMyHelper *strongSelf = weakSelf;
+            if (strongSelf == nil) {
+                return;
+            }
+            if (sessionGen != strongSelf.liveSessionGeneration) {
+                if (transactionIdentifier != nil) {
+                    [[ServerConnection sharedInstance] sendMessage:@{
+                        @"transactionId": transactionIdentifier,
+                        @"live": @NO,
+                        @"superseded": @YES,
+                        @"handle": trimmedHandle,
+                        @"locations": @[],
+                    }];
+                }
+                return;
+            }
+            if (targetHandleObject == nil) {
+                if ([strongSelf.pendingLiveNormalizedIdentifier isEqualToString:normalizedTarget]) {
+                    strongSelf.pendingLiveNormalizedIdentifier = nil;
+                }
+                [strongSelf sendError:[NSString stringWithFormat:@"Find My friend handle not found: %@", trimmedHandle]
+                transactionIdentifier:transactionIdentifier];
+                return;
+            }
+
+            if ([strongSelf.pendingLiveNormalizedIdentifier isEqualToString:normalizedTarget]) {
+                strongSelf.pendingLiveNormalizedIdentifier = nil;
+            }
+            strongSelf.activeLiveNormalizedIdentifier = normalizedTarget;
+            strongSelf.activeLiveHandleObject = targetHandleObject;
+
+            @synchronized (strongSelf.inFlightRefreshHandleCounts) {
+                NSInteger count = [strongSelf.inFlightRefreshHandleCounts[normalizedTarget] integerValue];
+                strongSelf.inFlightRefreshHandleCounts[normalizedTarget] = @(count + 1);
+            }
+
+            void (^clearInFlightCount)(void) = ^{
+                @synchronized (strongSelf.inFlightRefreshHandleCounts) {
+                    NSInteger count = [strongSelf.inFlightRefreshHandleCounts[normalizedTarget] integerValue];
+                    if (count <= 1) {
+                        [strongSelf.inFlightRefreshHandleCounts removeObjectForKey:normalizedTarget];
+                    } else {
+                        strongSelf.inFlightRefreshHandleCounts[normalizedTarget] = @(count - 1);
+                    }
+                }
+            };
+
+            id cachedLocation = [strongSelf cachedLocationForHandle:targetHandleObject session:session];
+            BOOL cachedIsLive = cachedLocation != nil &&
+                [cachedLocation respondsToSelector:@selector(locationType)] &&
+                [(id<BBFindMyLocationType>)cachedLocation locationType] == 2;
+            NSDictionary *cachedPayload = [FindMyFriendPayload
+                locationPayloadForLocation:cachedLocation
+                                    handle:targetHandleObject
+                      isLocatingInProgress:cachedIsLive ? @NO : @YES];
+
+            if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:reverseGeocode:completion:)]) {
+                [session startRefreshingLocationForHandles:@[targetHandleObject]
+                                                  priority:BBLiveLocationRefreshPriority
+                                               isFromGroup:NO
+                                            reverseGeocode:YES
+                                                completion:^{
+                    clearInFlightCount();
+                }];
+            } else if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
+                [session startRefreshingLocationForHandles:@[targetHandleObject]
+                                                  priority:BBLiveLocationRefreshPriority
+                                               isFromGroup:NO
+                                                completion:^{
+                    clearInFlightCount();
+                }];
+            } else {
+                clearInFlightCount();
+            }
+
+            // Safety valve so locating indicator does not stay stuck if Apple's completion hangs.
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(BBLocationRefreshTimeoutSeconds * NSEC_PER_SEC)),
+                dispatch_get_main_queue(),
+                ^{
+                    if (sessionGen == strongSelf.liveSessionGeneration) {
+                        clearInFlightCount();
+                    }
+                }
+            );
+
+            if (transactionIdentifier != nil) {
+                NSString *canonicalHandle = [FindMyFriendPayload identifierForHandle:targetHandleObject] ?: trimmedHandle;
+                [[ServerConnection sharedInstance] sendMessage:@{
+                    @"transactionId": transactionIdentifier,
+                    @"live": @YES,
+                    @"handle": canonicalHandle,
+                    @"locations": cachedPayload != nil ? @[cachedPayload] : @[],
+                }];
+            }
+        }];
+    });
+}
+
+- (void)handleStopLiveLocationForTransactionIdentifier:(nullable NSString *)transactionIdentifier
+                                                  data:(nullable NSDictionary *)data {
+    NSString *rawHandle = [data[@"handle"] isKindOfClass:[NSString class]] ? data[@"handle"] : nil;
+    NSString *trimmedHandle = [rawHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *normalizedTarget = trimmedHandle.length > 0 ? trimmedHandle.lowercaseString : nil;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        FindMyLocateSession *session = self.activeLocateSession;
+        NSString *currentLiveIdentifier = self.activeLiveNormalizedIdentifier ?: self.pendingLiveNormalizedIdentifier;
+
+        if (normalizedTarget != nil &&
+            currentLiveIdentifier != nil &&
+            ![currentLiveIdentifier isEqualToString:normalizedTarget]) {
+            if (transactionIdentifier != nil) {
+                [[ServerConnection sharedInstance] sendMessage:@{
+                    @"transactionId": transactionIdentifier,
+                    @"stopped": @NO,
+                    @"handle": trimmedHandle,
+                    @"activeHandle": currentLiveIdentifier,
+                }];
+            }
+            return;
+        }
+
+        self.liveSessionGeneration += 1;
+        id handleToStop = self.activeLiveHandleObject;
+        NSString *stoppedIdentifier = currentLiveIdentifier ?: normalizedTarget;
+        self.activeLiveHandleObject = nil;
+        self.activeLiveNormalizedIdentifier = nil;
+        self.pendingLiveNormalizedIdentifier = nil;
+
+        [self stopLiveRefreshForHandleObject:handleToStop normalizedIdentifier:stoppedIdentifier session:session];
+
+        if (transactionIdentifier != nil) {
+            [[ServerConnection sharedInstance] sendMessage:@{
+                @"transactionId": transactionIdentifier,
+                @"stopped": @(handleToStop != nil),
+                @"handle": stoppedIdentifier ?: [NSNull null],
+            }];
+        }
+    });
+}
+
+- (void)handleFriendsRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier
+                                                data:(nullable NSDictionary *)data {
     FindMyLocateSession *session = [self locateSession];
     if (session == nil) {
         [self sendError:@"FindMyLocateSession is unavailable" transactionIdentifier:transactionIdentifier];
         return;
+    }
+
+    NSString *rawHandle = [data[@"handle"] isKindOfClass:[NSString class]] ? data[@"handle"] : nil;
+    NSString *trimmedHandle = [rawHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *focusedHandle = trimmedHandle.length > 0 ? trimmedHandle : nil;
+    BOOL targetedOnly = focusedHandle != nil;
+    NSString *normalizedFocusKey = focusedHandle.lowercaseString;
+    if (normalizedFocusKey != nil) {
+        @synchronized (self.inFlightRefreshHandleCounts) {
+            NSInteger count = [self.inFlightRefreshHandleCounts[normalizedFocusKey] integerValue];
+            self.inFlightRefreshHandleCounts[normalizedFocusKey] = @(count + 1);
+        }
     }
 
     __weak typeof(self) weakSelf = self;
@@ -235,16 +612,31 @@ static os_log_t helperLog;
     FindMyFriendsRefreshCoordinator *coordinator = [[FindMyFriendsRefreshCoordinator alloc]
         initWithSession:session
         transactionIdentifier:transactionIdentifier
+        focusedHandle:focusedHandle
+        targetedOnly:targetedOnly
         friendListTimeout:BBFriendListTimeoutSeconds
         locationRefreshTimeout:BBLocationRefreshTimeoutSeconds
         responseHandler:^(NSDictionary *response) {
             [[ServerConnection sharedInstance] sendMessage:response];
             FindMyHelper *strongSelf = weakSelf;
             if (strongSelf != nil) {
+                if (normalizedFocusKey != nil) {
+                    @synchronized (strongSelf.inFlightRefreshHandleCounts) {
+                        NSInteger count = [strongSelf.inFlightRefreshHandleCounts[normalizedFocusKey] integerValue];
+                        if (count <= 1) {
+                            [strongSelf.inFlightRefreshHandleCounts removeObjectForKey:normalizedFocusKey];
+                        } else {
+                            strongSelf.inFlightRefreshHandleCounts[normalizedFocusKey] = @(count - 1);
+                        }
+                    }
+                }
                 if (weakCoordinator != nil) {
                     [strongSelf.activeFriendRefreshes removeObject:weakCoordinator];
                 }
-                [strongSelf startStreamingLocationsForAllFriends:session];
+                if (!strongSelf.friendStreamingStarted || !targetedOnly) {
+                    strongSelf.friendStreamingStarted = YES;
+                    [strongSelf startStreamingLocationsForAllFriends:session focusedHandle:focusedHandle];
+                }
             }
         }];
     weakCoordinator = coordinator;

@@ -4,11 +4,15 @@
 
 #import "FindMyFriendPayload.h"
 
-static const long long BBLocationRefreshPriority = 1000;
+// FindMyLocate.LocatePriority raw values: 0=backgroundAppRefresh, 1=shallow, 2=live, 3=backgroundProactive.
+static const long long BBLocationRefreshPriority = 1;
+static const long long BBFocusedLocationRefreshPriority = 2;
 
 @interface FindMyFriendsRefreshCoordinator ()
 @property(nonatomic, strong) id<FindMyLocateSessionProtocol> session;
 @property(nonatomic, copy, nullable) NSString *transactionIdentifier;
+@property(nonatomic, copy, nullable) NSString *focusedHandle;
+@property(nonatomic) BOOL targetedOnly;
 @property(nonatomic) NSTimeInterval friendListTimeout;
 @property(nonatomic) NSTimeInterval locationRefreshTimeout;
 @property(nonatomic, copy) FindMyFriendsRefreshResponseHandler responseHandler;
@@ -30,6 +34,36 @@ static os_log_t refreshLog;
                friendListTimeout:(NSTimeInterval)friendListTimeout
           locationRefreshTimeout:(NSTimeInterval)locationRefreshTimeout
                  responseHandler:(FindMyFriendsRefreshResponseHandler)responseHandler {
+    return [self initWithSession:session
+           transactionIdentifier:transactionIdentifier
+                   focusedHandle:nil
+               friendListTimeout:friendListTimeout
+          locationRefreshTimeout:locationRefreshTimeout
+                 responseHandler:responseHandler];
+}
+
+- (instancetype)initWithSession:(id<FindMyLocateSessionProtocol>)session
+           transactionIdentifier:(nullable NSString *)transactionIdentifier
+                   focusedHandle:(nullable NSString *)focusedHandle
+               friendListTimeout:(NSTimeInterval)friendListTimeout
+          locationRefreshTimeout:(NSTimeInterval)locationRefreshTimeout
+                 responseHandler:(FindMyFriendsRefreshResponseHandler)responseHandler {
+    return [self initWithSession:session
+           transactionIdentifier:transactionIdentifier
+                   focusedHandle:focusedHandle
+                    targetedOnly:NO
+               friendListTimeout:friendListTimeout
+          locationRefreshTimeout:locationRefreshTimeout
+                 responseHandler:responseHandler];
+}
+
+- (instancetype)initWithSession:(id<FindMyLocateSessionProtocol>)session
+           transactionIdentifier:(nullable NSString *)transactionIdentifier
+                   focusedHandle:(nullable NSString *)focusedHandle
+                    targetedOnly:(BOOL)targetedOnly
+               friendListTimeout:(NSTimeInterval)friendListTimeout
+          locationRefreshTimeout:(NSTimeInterval)locationRefreshTimeout
+                 responseHandler:(FindMyFriendsRefreshResponseHandler)responseHandler {
     self = [super init];
     if (self == nil) {
         return nil;
@@ -37,6 +71,9 @@ static os_log_t refreshLog;
 
     _session = session;
     _transactionIdentifier = [transactionIdentifier copy];
+    NSString *trimmedFocus = [focusedHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    _focusedHandle = trimmedFocus.length > 0 ? [trimmedFocus copy] : nil;
+    _targetedOnly = targetedOnly && _focusedHandle != nil;
     _friendListTimeout = friendListTimeout;
     _locationRefreshTimeout = locationRefreshTimeout;
     _responseHandler = [responseHandler copy];
@@ -95,6 +132,33 @@ static os_log_t refreshLog;
     return [cachedFriends isKindOfClass:[NSArray class]] ? cachedFriends : @[];
 }
 
+- (NSArray *)prioritizedFriendRecords:(NSArray *)friendRecords {
+    if (self.focusedHandle == nil) {
+        return friendRecords;
+    }
+
+    NSMutableArray *focusedRecords = [[NSMutableArray alloc] init];
+    NSMutableArray *remainingRecords = [[NSMutableArray alloc] initWithCapacity:friendRecords.count];
+    for (id friendRecord in friendRecords) {
+        id locationHandle = [self locationHandleForFriend:friendRecord];
+        NSString *friendIdentifier = [FindMyFriendPayload identifierForHandle:locationHandle];
+        if (friendIdentifier != nil && [friendIdentifier caseInsensitiveCompare:self.focusedHandle] == NSOrderedSame) {
+            [focusedRecords addObject:friendRecord];
+        } else if (!self.targetedOnly) {
+            [remainingRecords addObject:friendRecord];
+        }
+    }
+
+    if (self.targetedOnly) {
+        return focusedRecords;
+    }
+    if (focusedRecords.count == 0) {
+        return friendRecords;
+    }
+    [focusedRecords addObjectsFromArray:remainingRecords];
+    return focusedRecords;
+}
+
 - (void)refreshAndSendLocationsForFriends:(NSArray *)friendRecords friendListTimedOut:(BOOL)friendListTimedOut {
     NSMutableDictionary<NSString *, NSDictionary *> *locationsByFriendIdentifier = [[NSMutableDictionary alloc] init];
     NSMutableSet<NSString *> *pendingFriendIdentifiers = [[NSMutableSet alloc] init];
@@ -102,7 +166,8 @@ static os_log_t refreshLog;
     dispatch_group_t locationRefreshGroup = dispatch_group_create();
     __block NSUInteger unidentifiedFriendCount = 0;
 
-    for (id friendRecord in friendRecords) {
+    NSArray *orderedFriendRecords = [self prioritizedFriendRecords:friendRecords];
+    for (id friendRecord in orderedFriendRecords) {
         id locationHandle = [self locationHandleForFriend:friendRecord];
         NSString *friendIdentifier = [FindMyFriendPayload identifierForHandle:locationHandle];
         if (friendIdentifier == nil) {
@@ -112,7 +177,8 @@ static os_log_t refreshLog;
 
         NSDictionary *cachedLocationPayload = [FindMyFriendPayload
             locationPayloadForLocation:[self cachedLocationForHandle:locationHandle]
-                                 handle:locationHandle];
+                                 handle:locationHandle
+                   isLocatingInProgress:@YES];
         if (cachedLocationPayload == nil) {
             unidentifiedFriendCount += 1;
             continue;
@@ -141,7 +207,8 @@ static os_log_t refreshLog;
 
                 NSDictionary *refreshedLocationPayload = [FindMyFriendPayload
                     locationPayloadForLocation:[self cachedLocationForHandle:locationHandle]
-                                         handle:locationHandle];
+                                         handle:locationHandle
+                           isLocatingInProgress:nil];
                 if (refreshedLocationPayload != nil) {
                     locationsByFriendIdentifier[friendIdentifier] = refreshedLocationPayload;
                 }
@@ -151,15 +218,19 @@ static os_log_t refreshLog;
         };
         [completeLocationRefreshBlocks addObject:completeLocationRefresh];
 
+        BOOL isFocusedFriend = self.focusedHandle != nil &&
+            [friendIdentifier caseInsensitiveCompare:self.focusedHandle] == NSOrderedSame;
+        long long refreshPriority = isFocusedFriend ? BBFocusedLocationRefreshPriority : BBLocationRefreshPriority;
+
         if ([self.session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:reverseGeocode:completion:)]) {
             [self.session startRefreshingLocationForHandles:@[locationHandle]
-                                                   priority:BBLocationRefreshPriority
+                                                   priority:refreshPriority
                                                 isFromGroup:NO
                                              reverseGeocode:YES
                                                  completion:completeLocationRefresh];
         } else if ([self.session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
             [self.session startRefreshingLocationForHandles:@[locationHandle]
-                                                   priority:BBLocationRefreshPriority
+                                                   priority:refreshPriority
                                                 isFromGroup:NO
                                                  completion:completeLocationRefresh];
         } else {
@@ -223,6 +294,14 @@ static os_log_t refreshLog;
 }
 
 - (void)start {
+    if (self.targetedOnly && self.focusedHandle != nil) {
+        NSArray *cachedTarget = [self prioritizedFriendRecords:[self cachedFriends]];
+        if (cachedTarget.count > 0) {
+            [self resolveFriendList:cachedTarget timedOut:NO];
+            return;
+        }
+    }
+
     if (![self.session respondsToSelector:@selector(getFriendsSharingLocationsWithMeWithCompletion:)]) {
         [self resolveFriendList:[self cachedFriends] timedOut:NO];
         return;

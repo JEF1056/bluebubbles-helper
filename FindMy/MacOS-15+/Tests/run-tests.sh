@@ -54,3 +54,44 @@ xcrun --sdk macosx swiftc \
     -o "$BUILD_DIR/FindMyDeviceSnapshotTests"
 
 "$BUILD_DIR/FindMyDeviceSnapshotTests"
+
+HOST_ARCH="$(uname -m)"
+xcrun --sdk macosx swiftc \
+    -warnings-as-errors \
+    -parse-as-library \
+    -target "${HOST_ARCH}-apple-macos15.0" \
+    -sdk "$SDKROOT" \
+    -c "$SOURCE_DIR/FindMyDeviceSnapshot.swift" \
+    -o "$BUILD_DIR/FindMyDeviceSnapshot.o"
+
+xcrun --sdk macosx clang \
+    -fobjc-arc \
+    -fmodules \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -Wno-deprecated-declarations \
+    -isysroot "$SDKROOT" \
+    -mmacosx-version-min=15.0 \
+    -I "$SOURCE_DIR" \
+    -I "$SOCKET_DIR" \
+    -L"$SDKROOT/usr/lib/swift" \
+    -Wl,-rpath,/usr/lib/swift \
+    "$SOURCE_DIR/FindMyFriendPayload.m" \
+    "$SOURCE_DIR/FindMyDevicesDataSourceCapture.m" \
+    "$SOURCE_DIR/FindMyDevicesRefreshCoordinator.m" \
+    "$SOURCE_DIR/FindMyFriendsRefreshCoordinator.m" \
+    "$SOURCE_DIR/FindMyDeviceSnapshotBridge.m" \
+    "$SOURCE_DIR/FindMyHelper.m" \
+    "$SOURCE_DIR/ServerConnection.m" \
+    "$SOCKET_DIR/GCDAsyncSocket.m" \
+    "$ROOT_DIR/Tests/FindMyHelperLiveTests.m" \
+    "$BUILD_DIR/FindMyDeviceSnapshot.o" \
+    -framework Foundation \
+    -framework CoreLocation \
+    -framework Security \
+    -framework CFNetwork \
+    -framework CoreServices \
+    -o "$BUILD_DIR/FindMyHelperLiveTests"
+
+"$BUILD_DIR/FindMyHelperLiveTests"

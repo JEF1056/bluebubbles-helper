@@ -14,6 +14,21 @@ typedef void (^FindMyFriendsRefreshResponseHandler)(NSDictionary *response);
           locationRefreshTimeout:(NSTimeInterval)locationRefreshTimeout
                  responseHandler:(FindMyFriendsRefreshResponseHandler)responseHandler;
 
+- (instancetype)initWithSession:(id<FindMyLocateSessionProtocol>)session
+           transactionIdentifier:(nullable NSString *)transactionIdentifier
+                   focusedHandle:(nullable NSString *)focusedHandle
+               friendListTimeout:(NSTimeInterval)friendListTimeout
+          locationRefreshTimeout:(NSTimeInterval)locationRefreshTimeout
+                 responseHandler:(FindMyFriendsRefreshResponseHandler)responseHandler;
+
+- (instancetype)initWithSession:(id<FindMyLocateSessionProtocol>)session
+           transactionIdentifier:(nullable NSString *)transactionIdentifier
+                   focusedHandle:(nullable NSString *)focusedHandle
+                    targetedOnly:(BOOL)targetedOnly
+               friendListTimeout:(NSTimeInterval)friendListTimeout
+          locationRefreshTimeout:(NSTimeInterval)locationRefreshTimeout
+                 responseHandler:(FindMyFriendsRefreshResponseHandler)responseHandler;
+
 - (void)start;
 
 @end

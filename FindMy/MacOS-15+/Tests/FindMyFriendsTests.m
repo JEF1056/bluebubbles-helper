@@ -23,8 +23,18 @@
 @implementation BBMockFriendRecord
 @end
 
+@interface BBMockPlaceMark : NSObject
+@property(nonatomic, copy) NSArray<NSString *> *formattedAddressLines;
+@property(nonatomic, copy) NSString *locality;
+@property(nonatomic, copy) NSString *stateCode;
+@end
+
+@implementation BBMockPlaceMark
+@end
+
 @interface BBMockLocation : NSObject
 @property(nonatomic) double altitude;
+@property(nonatomic, strong) BBMockPlaceMark *address;
 @property(nonatomic, copy) NSString *coarseAddressLabel;
 @property(nonatomic) double horizontalAccuracy;
 @property(nonatomic, copy) NSArray *labels;
@@ -34,6 +44,7 @@
 @property(nonatomic) double speed;
 @property(nonatomic) double timestamp;
 @property(nonatomic) double verticalAccuracy;
+@property(nonatomic) BOOL locatingInProgress;
 @end
 
 @implementation BBMockLocation
@@ -44,6 +55,8 @@
 @property(nonatomic, copy) NSArray *cachedFriends;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, id> *locationsByIdentifier;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, FindMyCompletion> *pendingRefreshes;
+@property(nonatomic, strong) NSMutableArray<NSString *> *recordedRefreshOrder;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *recordedRefreshPriorities;
 @property(nonatomic, copy) NSSet<NSString *> *immediateRefreshIdentifiers;
 @property(nonatomic) BOOL withholdFriendList;
 @property(nonatomic) BOOL duplicateImmediateRefreshCallbacks;
@@ -58,6 +71,8 @@
         _cachedFriends = @[];
         _locationsByIdentifier = [[NSMutableDictionary alloc] init];
         _pendingRefreshes = [[NSMutableDictionary alloc] init];
+        _recordedRefreshOrder = [[NSMutableArray alloc] init];
+        _recordedRefreshPriorities = [[NSMutableDictionary alloc] init];
         _immediateRefreshIdentifiers = [NSSet set];
     }
     return self;
@@ -84,6 +99,10 @@
                             reverseGeocode:(BOOL)reverseGeocode
                                 completion:(FindMyCompletion)completion {
     NSString *identifier = [FindMyFriendPayload identifierForHandle:locationHandles.firstObject];
+    if (identifier != nil) {
+        [self.recordedRefreshOrder addObject:identifier];
+        self.recordedRefreshPriorities[identifier] = @(priority);
+    }
     if ([self.immediateRefreshIdentifiers containsObject:identifier]) {
         completion();
         if (self.duplicateImmediateRefreshCallbacks) {
@@ -136,6 +155,9 @@
 
 @end
 
+static NSUInteger BBRecordedServerRegistrations = 0;
+static NSMutableArray<NSDictionary *> *BBRecordedServerActions = nil;
+
 @implementation FindMyHelper
 
 + (instancetype)sharedInstance {
@@ -143,12 +165,28 @@
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         helper = [[self alloc] init];
+        BBRecordedServerActions = [[NSMutableArray alloc] init];
     });
     return helper;
 }
 
 - (void)handleServerAction:(nullable NSString *)action
      transactionIdentifier:(nullable NSString *)transactionIdentifier {
+    [self handleServerAction:action data:nil transactionIdentifier:transactionIdentifier];
+}
+
+- (void)handleServerAction:(nullable NSString *)action
+                      data:(nullable NSDictionary *)data
+     transactionIdentifier:(nullable NSString *)transactionIdentifier {
+    [BBRecordedServerActions addObject:@{
+        @"action": action ?: [NSNull null],
+        @"data": data ?: [NSNull null],
+        @"transactionId": transactionIdentifier ?: [NSNull null],
+    }];
+}
+
+- (void)handleServerRegistered {
+    BBRecordedServerRegistrations += 1;
 }
 
 @end
@@ -216,6 +254,26 @@ static void BBTestPayload(void) {
     BBAssert([liveLocationPayload[@"long_address"] isEqualToString:@"Seattle, WA"], @"address must use an explicit string field");
     BBAssert([liveLocationPayload[@"last_updated"] isEqual:@1234567], @"timestamps must be converted to milliseconds");
     BBAssert([liveLocationPayload[@"status"] isEqualToString:@"live"], @"location type 2 must map to live");
+    BBAssert([liveLocationPayload[@"location_type"] isEqual:@2], @"location_type must preserve numeric enum");
+    BBAssert([liveLocationPayload[@"horizontal_accuracy"] isEqual:@6.5], @"horizontal_accuracy must be preserved");
+    BBAssert([liveLocationPayload[@"speed"] isEqual:@1.25], @"speed must be preserved");
+    BBAssert([liveLocationPayload[@"altitude"] isEqual:@32.0], @"altitude must be preserved");
+
+    BBMockLocation *placemarkLocation = [[BBMockLocation alloc] init];
+    placemarkLocation.latitude = 37.3349;
+    placemarkLocation.longitude = -122.009;
+    placemarkLocation.timestamp = 2000.0;
+    placemarkLocation.locationType = 2;
+    BBMockPlaceMark *placemark = [[BBMockPlaceMark alloc] init];
+    placemark.formattedAddressLines = @[@"1 Apple Park Way", @"Cupertino, CA 95014"];
+    placemark.locality = @"Cupertino";
+    placemark.stateCode = @"CA";
+    placemarkLocation.address = placemark;
+    NSDictionary *placemarkPayload = [FindMyFriendPayload locationPayloadForLocation:placemarkLocation handle:aliceHandle];
+    BBAssert([placemarkPayload[@"long_address"] isEqualToString:@"1 Apple Park Way, Cupertino, CA 95014"],
+             @"placemark formattedAddressLines must populate long_address");
+    BBAssert([placemarkPayload[@"short_address"] isEqualToString:@"Cupertino, CA"],
+             @"placemark locality/state must populate short_address");
 
     NSDictionary *locationsByFriendIdentifier = @{
         @"bob@example.com": [FindMyFriendPayload
@@ -284,6 +342,12 @@ static void BBTestLocationTimeoutAndLateCallbacks(void) {
     BBAssert([response[@"partial"] isEqual:@YES], @"location timeout must mark the response partial");
     BBAssert([response[@"locations"] count] == 2, @"timed-out friends must remain in the response");
     BBAssert([response[@"timedOutHandles"] isEqual:@[@"bob@example.com"]], @"timed-out handles must be retained");
+    NSDictionary *alicePayload = response[@"locations"][0];
+    NSDictionary *bobPayload = response[@"locations"][1];
+    BBAssert([alicePayload[@"is_locating_in_progress"] isEqual:@NO],
+             @"completed friend refresh must report is_locating_in_progress = NO");
+    BBAssert([bobPayload[@"is_locating_in_progress"] isEqual:@YES],
+             @"timed-out pending friend refresh must report is_locating_in_progress = YES");
 
     FindMyCompletion lateCompletion = session.pendingRefreshes[bobHandle.identifier];
     BBAssert(lateCompletion != nil, @"the delayed refresh callback must be captured");
@@ -427,6 +491,97 @@ static void BBTestDeviceDataSourceTimeout(void) {
              @"a missing Devices data source must return an explicit error");
 }
 
+static void BBTestFocusedHandlePrioritizationAndLocatingState(void) {
+    FMLHandle *aliceHandle = BBHandleWithIdentifier(@"alice@example.com");
+    FMLHandle *bobHandle = BBHandleWithIdentifier(@"bob@example.com");
+    BBMockLocation *locatingLocation = [[BBMockLocation alloc] init];
+    locatingLocation.latitude = 37.77;
+    locatingLocation.longitude = -122.41;
+    locatingLocation.timestamp = 1700000.0;
+    locatingLocation.locationType = 1;
+    locatingLocation.locatingInProgress = YES;
+
+    NSDictionary *locatingPayload = [FindMyFriendPayload locationPayloadForLocation:locatingLocation handle:bobHandle];
+    BBAssert([locatingPayload[@"is_locating_in_progress"] isEqual:@YES],
+             @"location payload must reflect locatingInProgress from the location object");
+
+    BBMockFindMySession *session = [[BBMockFindMySession alloc] init];
+    session.friends = @[aliceHandle, bobHandle];
+    session.immediateRefreshIdentifiers = [NSSet setWithObjects:aliceHandle.identifier, bobHandle.identifier, nil];
+
+    __block NSMutableArray<NSDictionary *> *responses = [[NSMutableArray alloc] init];
+    FindMyFriendsRefreshCoordinator *coordinator = [[FindMyFriendsRefreshCoordinator alloc]
+        initWithSession:session
+        transactionIdentifier:@"focused-refresh"
+        focusedHandle:@"BOB@example.com"
+        friendListTimeout:0.05
+        locationRefreshTimeout:0.05
+        responseHandler:^(NSDictionary *response) {
+            [responses addObject:response];
+        }];
+    [coordinator start];
+
+    BBAssert(BBWaitUntil(^BOOL { return responses.count == 1; }, 0.2),
+             @"focused handle refresh must complete");
+    BBAssert([session.recordedRefreshOrder isEqual:@[@"bob@example.com", @"alice@example.com"]],
+             @"focused handle must be dispatched before other friends");
+    BBAssert([session.recordedRefreshPriorities[@"bob@example.com"] longLongValue] >
+             [session.recordedRefreshPriorities[@"alice@example.com"] longLongValue],
+             @"focused handle must receive elevated refresh priority");
+    BBAssert([session.recordedRefreshPriorities[@"bob@example.com"] longLongValue] == 2 &&
+             [session.recordedRefreshPriorities[@"alice@example.com"] longLongValue] == 1,
+             @"refresh priorities must match FindMyLocate.LocatePriority raw values (1=shallow, 2=live)");
+
+    [BBRecordedServerActions removeAllObjects];
+    NSUInteger registrationsBefore = BBRecordedServerRegistrations;
+    ServerConnection *connection = [[ServerConnection alloc] init];
+    BBRecordingSocket *socket = [[BBRecordingSocket alloc] init];
+    [connection setValue:socket forKey:@"socket"];
+    [connection socket:socket didConnectToHost:@"localhost" port:45675];
+    BBAssert(BBRecordedServerRegistrations == registrationsBefore + 1,
+             @"ServerConnection connect must notify FindMyHelper registration");
+
+    NSData *payload = [NSJSONSerialization dataWithJSONObject:@{
+        @"action": @"refresh-findmy-friends",
+        @"data": @{@"handle": @"bob@example.com", @"force": @YES},
+        @"transactionId": @"tx-focused",
+    } options:0 error:nil];
+    [connection socket:socket didReadData:payload withTag:0];
+    BBAssert(BBRecordedServerActions.count == 1, @"ServerConnection must dispatch read actions");
+    BBAssert([BBRecordedServerActions.firstObject[@"data"][@"handle"] isEqualToString:@"bob@example.com"],
+             @"ServerConnection must forward action data dictionary to FindMyHelper");
+}
+
+static void BBTestTargetedOnlyRefreshSkipsOtherFriends(void) {
+    FMLHandle *aliceHandle = BBHandleWithIdentifier(@"alice@example.com");
+    FMLHandle *bobHandle = BBHandleWithIdentifier(@"bob@example.com");
+    BBMockFindMySession *session = [[BBMockFindMySession alloc] init];
+    session.friends = @[aliceHandle, bobHandle];
+    session.cachedFriends = @[aliceHandle, bobHandle];
+    session.immediateRefreshIdentifiers = [NSSet setWithObjects:bobHandle.identifier, nil];
+
+    __block NSMutableArray<NSDictionary *> *responses = [[NSMutableArray alloc] init];
+    FindMyFriendsRefreshCoordinator *coordinator = [[FindMyFriendsRefreshCoordinator alloc]
+        initWithSession:session
+        transactionIdentifier:@"targeted-refresh"
+        focusedHandle:@"BOB@example.com"
+        targetedOnly:YES
+        friendListTimeout:0.05
+        locationRefreshTimeout:0.05
+        responseHandler:^(NSDictionary *response) {
+            [responses addObject:response];
+        }];
+    [coordinator start];
+
+    BBAssert(BBWaitUntil(^BOOL { return responses.count == 1; }, 0.2),
+             @"targeted refresh must complete promptly");
+    BBAssert([session.recordedRefreshOrder isEqual:@[@"bob@example.com"]],
+             @"targeted refresh must only refresh the requested handle");
+    NSArray *locations = responses.firstObject[@"locations"];
+    BBAssert(locations.count == 1 && [locations.firstObject[@"handle"] isEqualToString:@"bob@example.com"],
+             @"targeted refresh must return only the requested handle");
+}
+
 int main(void) {
     @autoreleasepool {
         BBTestPayload();
@@ -437,6 +592,8 @@ int main(void) {
         BBTestDeviceDataSourceCapture();
         BBTestDeviceDataSourceReadiness();
         BBTestDeviceDataSourceTimeout();
+        BBTestFocusedHandlePrioritizationAndLocatingState();
+        BBTestTargetedOnlyRefreshSkipsOtherFriends();
         NSLog(@"PASS: FindMyFriendsTests");
     }
 

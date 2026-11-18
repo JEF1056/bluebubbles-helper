@@ -12,6 +12,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)handleServerAction:(nullable NSString *)action
      transactionIdentifier:(nullable NSString *)transactionIdentifier;
 
+- (void)handleServerAction:(nullable NSString *)action
+                      data:(nullable NSDictionary *)data
+     transactionIdentifier:(nullable NSString *)transactionIdentifier;
+
+- (void)handleServerRegistered;
+
 @end
 
 NS_ASSUME_NONNULL_END
