@@ -86,6 +86,7 @@ else
             "$ROOT_DIR/BlueBubblesHelper/FindMyDevicesDataSourceCapture.m" \
             "$ROOT_DIR/BlueBubblesHelper/FindMyDeviceSnapshotBridge.m" \
             "$ROOT_DIR/BlueBubblesHelper/FindMyDevicesRefreshCoordinator.m" \
+            "$ROOT_DIR/BlueBubblesHelper/FindMyPeopleFocusController.m" \
             "$ROOT_DIR/BlueBubblesHelper/FindMyHelper.m" \
             "$ROOT_DIR/Pods/CocoaAsyncSocket/Source/GCD/GCDAsyncSocket.m" \
             "$ARCH_DIR/FindMyDeviceSnapshot.o" \

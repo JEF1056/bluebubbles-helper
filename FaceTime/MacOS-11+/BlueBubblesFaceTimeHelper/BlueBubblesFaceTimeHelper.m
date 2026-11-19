@@ -54,6 +54,9 @@ static NSString *BBExtractCallUUID(NSDictionary *data) {
 - (NSDictionary *)callStatusPayloadForCall:(TUCall *)call;
 - (void)callStatusChanged:(NSNotification *)notification;
 - (void)handleMessage:(NetworkController *)controller message:(NSString *)message;
+- (TUConversationManager *)sharedConversationManager;
+- (void)sendGeneratedLinkReply:(TUConversationLink *)link error:(NSError *)error transaction:(NSString *)transaction replyController:(NetworkController *)replyController;
+- (void)generateLinkForCallUUID:(NSString *)callUUID attemptsLeft:(NSInteger)attemptsLeft linkRetriesLeft:(NSInteger)linkRetriesLeft transaction:(NSString *)transaction replyController:(NetworkController *)replyController;
 @end
 
 // This can be used to dump the methods of any class
@@ -64,6 +67,99 @@ static NSString *BBExtractCallUUID(NSDictionary *data) {
 BLUEBUBBLESFACETIMEHELPER *plugin;
 
 @implementation BLUEBUBBLESFACETIMEHELPER
+
+- (TUConversationManager *)sharedConversationManager {
+    TUConversationManager *manager = [[TUCallCenter sharedInstance] conversationManager];
+    if (manager != nil) return manager;
+    static TUConversationManager *fallbackManager = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        fallbackManager = [[TUConversationManager alloc] init];
+    });
+    return fallbackManager;
+}
+
+- (void)sendGeneratedLinkReply:(TUConversationLink *)link
+                         error:(NSError *)error
+                   transaction:(NSString *)transaction
+               replyController:(NetworkController *)replyController {
+    if (transaction == nil) return;
+    NSString *urlString = [[link URL] absoluteString];
+    if ([urlString length] > 0) {
+        [replyController sendMessage:@{@"transactionId": transaction, @"url": urlString}];
+    } else {
+        NSString *errMsg = error != nil ? ([error localizedDescription] ?: @"Failed to generate FaceTime link!") : @"Failed to generate FaceTime link!";
+        [replyController sendMessage:@{@"transactionId": transaction, @"error": errMsg}];
+    }
+}
+
+- (void)generateLinkForCallUUID:(NSString *)callUUID
+                   attemptsLeft:(NSInteger)attemptsLeft
+                linkRetriesLeft:(NSInteger)linkRetriesLeft
+                    transaction:(NSString *)transaction
+                replyController:(NetworkController *)replyController {
+    TUCallCenter *callCenter = [TUCallCenter sharedInstance];
+    TUCall *call = [callCenter callWithCallUUID:callUUID];
+    if (call == nil || [call callStatus] == 6) {
+        if (transaction != nil) {
+            [replyController sendMessage:@{@"transactionId": transaction, @"error": @"Call is no longer active!"}];
+        }
+        return;
+    }
+
+    TUConversation *convo = [callCenter activeConversationForCall:call];
+    // Wait until callservicesd has joined/registered the conversation (avoids dropped XPC link completion).
+    BOOL convoReady = convo != nil && (([convo respondsToSelector:@selector(hasJoined)] && [convo hasJoined]) ||
+                                       ([convo respondsToSelector:@selector(state)] && [convo state] >= 2));
+    if (!convoReady) {
+        if (attemptsLeft > 0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                [self generateLinkForCallUUID:callUUID attemptsLeft:(attemptsLeft - 1) linkRetriesLeft:linkRetriesLeft transaction:transaction replyController:replyController];
+            });
+            return;
+        }
+        if (convo == nil) {
+            if (transaction != nil) {
+                [replyController sendMessage:@{@"transactionId": transaction, @"error": @"No active conversation found for call!"}];
+            }
+            return;
+        }
+    }
+
+    TUConversationLink *existingLink = [convo link];
+    if ([[[existingLink URL] absoluteString] length] > 0) {
+        [self sendGeneratedLinkReply:existingLink error:nil transaction:transaction replyController:replyController];
+        return;
+    }
+
+    TUConversationManager *manager = [self sharedConversationManager];
+    __block BOOL handled = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (handled) return;
+        handled = YES;
+        DLog("BLUEBUBBLESFACETIMEHELPER: generateLinkForConversation timed out (retriesLeft=%ld)", (long)linkRetriesLeft);
+        if (linkRetriesLeft > 0) {
+            [self generateLinkForCallUUID:callUUID attemptsLeft:attemptsLeft linkRetriesLeft:(linkRetriesLeft - 1) transaction:transaction replyController:replyController];
+            return;
+        }
+        [self sendGeneratedLinkReply:[convo link] error:nil transaction:transaction replyController:replyController];
+    });
+    [manager generateLinkForConversation:convo completionHandler:^(TUConversationLink *arg0, NSError *arg1) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (handled) return;
+            handled = YES;
+            DLog("BLUEBUBBLESFACETIMEHELPER: generated link for call %{public}@ (err=%{public}@)", [arg0 URL], arg1);
+            TUConversationLink *resolvedLink = arg0 ?: [convo link];
+            if ([[[resolvedLink URL] absoluteString] length] == 0 && linkRetriesLeft > 0) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+                    [self generateLinkForCallUUID:callUUID attemptsLeft:attemptsLeft linkRetriesLeft:(linkRetriesLeft - 1) transaction:transaction replyController:replyController];
+                });
+                return;
+            }
+            [self sendGeneratedLinkReply:resolvedLink error:arg1 transaction:transaction replyController:replyController];
+        });
+    }];
+}
 
 // BLUEBUBBLESFACETIMEHELPER is a singleton
 + (instancetype)sharedInstance {
@@ -331,51 +427,61 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
             [replyController sendMessage: @{@"transactionId": transaction, @"muted": @(muted)}];
         }
     } else if ([event isEqualToString:@"generate-link"]) {
-        if (data[@"callUUID"] != [NSNull null]) {
-            TUCall *call = [[TUCallCenter sharedInstance] callWithCallUUID:(data[@"callUUID"])];
-            TUConversation* convo = [[TUCallCenter sharedInstance] activeConversationForCall:call];
-            TUConversationManagerXPCClient *manager = [[TUConversationManagerXPCClient alloc] init];
-            [manager generateLinkForConversation:convo completionHandler:^(TUConversationLink *arg0, NSError *arg1) {
-                DLog("BLUEBUBBLESFACETIMEHELPER: generated link for call %{public}@", [arg0 URL]);
-                
-                if (transaction != nil) {
-                    [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"url": [[arg0 URL] absoluteString]}];
-                }
-            }];
+        NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        NSString *callUUID = BBExtractCallUUID(data);
+        if (callUUID != nil) {
+            [self generateLinkForCallUUID:callUUID attemptsLeft:200 linkRetriesLeft:5 transaction:transaction replyController:replyController];
         } else {
-            TUConversationManagerXPCClient *manager = [[TUConversationManagerXPCClient alloc] init];
-            [manager generateLinkWithInvitedMemberHandles:@[] linkLifetimeScope:0 completionHandler:^(TUConversationLink *arg0, NSError *arg1) {
-                DLog("BLUEBUBBLESFACETIMEHELPER: generated link %{public}@", [arg0 URL]);
-                
+            TUConversationManager *manager = [self sharedConversationManager];
+            if (manager == nil) {
                 if (transaction != nil) {
-                    [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"url": [[arg0 URL] absoluteString]}];
+                    [replyController sendMessage:@{@"transactionId": transaction, @"error": @"TUConversationManager unavailable!"}];
                 }
-            }];
+                return;
+            }
+            if ([manager respondsToSelector:@selector(generateLinkWithInvitedMemberHandles:linkLifetimeScope:completionHandler:)]) {
+                [manager generateLinkWithInvitedMemberHandles:@[] linkLifetimeScope:0 completionHandler:^(TUConversationLink *arg0, NSError *arg1) {
+                    [self sendGeneratedLinkReply:arg0 error:arg1 transaction:transaction replyController:replyController];
+                }];
+            } else if (transaction != nil) {
+                [replyController sendMessage:@{@"transactionId": transaction, @"error": @"Failed to generate generic link!"}];
+            }
         }
     } else if ([event isEqualToString:@"admit-pending-member"]) {
-        TUConversation* convo;
-        for (TUConversation* i in [[[TUConversationManager alloc] init] activeConversations]) {
-            if ([[[i groupUUID] UUIDString] isEqualToString:(data[@"conversationUUID"])]) {
+        NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        TUConversationManager *manager = [self sharedConversationManager];
+        TUConversation *convo = nil;
+        NSString *targetConvUUID = data[@"conversationUUID"];
+        NSString *targetHandleUUID = data[@"handleUUID"];
+
+        for (TUConversation *i in [self conversationCandidatesForManager:manager]) {
+            if ([[[i groupUUID] UUIDString] isEqualToString:targetConvUUID] || targetConvUUID == nil) {
                 convo = i;
                 break;
             }
         }
-        
+
+        BOOL admitted = NO;
         if (convo != nil) {
-            for (TUConversationMember *i in [convo pendingMembers]) {
-                DLog("BLUEBUBBLESFACETIMEHELPER: found pending member %{public}@", i);
-                if ([[[i handle] value] isEqualToString:(data[@"handleUUID"])]) {
-                    DLog("BLUEBUBBLESFACETIMEHELPER: approving pending member");
-                    [[[TUConversationManager alloc] init] approvePendingMember:i forConversation:convo];
-                    if (transaction != nil) {
-                        [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction}];
-                    }
+            for (TUConversationMember *member in [convo pendingMembers]) {
+                if ([[[member handle] value] isEqualToString:targetHandleUUID] || targetHandleUUID == nil) {
+                    [manager approvePendingMember:member forConversation:convo];
+                    admitted = YES;
                     break;
                 }
             }
         }
+
+        if (transaction != nil) {
+            if (admitted) {
+                [replyController sendMessage:@{@"transactionId": transaction}];
+            } else {
+                [replyController sendMessage:@{@"transactionId": transaction, @"error": @"Pending member or conversation not found!"}];
+            }
+        }
     } else if ([event isEqualToString:@"admit-any-pending-member"]) {
-        TUConversationManager *manager = [[TUConversationManager alloc] init];
+        NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        TUConversationManager *manager = [self sharedConversationManager];
         NSMutableArray *admittedMembers = [[NSMutableArray alloc] init];
 
         for (TUConversation *convo in [self conversationCandidatesForManager:manager]) {
@@ -390,7 +496,7 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         }
 
         if (transaction != nil) {
-            [[NetworkController sharedInstance] sendMessage: @{
+            [replyController sendMessage:@{
                 @"transactionId": transaction,
                 @"data": @{
                     @"admittedCount": @([admittedMembers count]),
@@ -399,14 +505,15 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
             }];
         }
     } else if ([event isEqualToString:@"get-conversation-state"]) {
-        TUConversationManager *manager = [[TUConversationManager alloc] init];
+        NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        TUConversationManager *manager = [self sharedConversationManager];
         NSMutableArray *conversations = [[NSMutableArray alloc] init];
         for (TUConversation *convo in [self conversationCandidatesForManager:manager]) {
             [conversations addObject:[self conversationDebugDictionary:convo]];
         }
 
         if (transaction != nil) {
-            [[NetworkController sharedInstance] sendMessage: @{
+            [replyController sendMessage:@{
                 @"transactionId": transaction,
                 @"data": @{
                     @"conversationCount": @([conversations count]),
@@ -415,12 +522,11 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
             }];
         }
     } else if ([event isEqualToString:@"get-active-links"]) {
-        NSArray<TUConversationLink*>* links = [[[[TUConversationManager alloc] init] activatedConversationLinks] allObjects];
+        NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        TUConversationManager *manager = [self sharedConversationManager];
+        NSArray<TUConversationLink*>* links = [[manager activatedConversationLinks] allObjects];
         
-        NSDictionary *data = @{
-            @"links": [[NSMutableArray alloc] initWithArray: @[]],
-        };
-        
+        NSMutableArray *linkArray = [NSMutableArray array];
         for (TUConversationLink* link in links) {
             NSMutableArray *handleArray = [NSMutableArray array];
             [[[link invitedMemberHandles] allObjects] enumerateObjectsUsingBlock:^(TUHandle* obj, NSUInteger idx, BOOL *stop) {
@@ -434,25 +540,41 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
                 @"name": [link linkName] ?: [NSNull null],
                 @"handles": handleArray ?: [NSNull null],
             };
-            
-            [data[@"links"] addObject:linkData];
+            [linkArray addObject:linkData];
         }
         
         if (transaction != nil) {
-            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"data": data}];
+            [replyController sendMessage:@{@"transactionId": transaction, @"data": @{@"links": linkArray}}];
         }
     } else if ([event isEqualToString:@"invalidate-link"]) {
-        NSArray<TUConversationLink*>* links = [[[[TUConversationManager alloc] init] activatedConversationLinks] allObjects];
+        NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        TUConversationManager *manager = [self sharedConversationManager];
+        NSArray<TUConversationLink*>* links = [[manager activatedConversationLinks] allObjects];
+        NSString *targetUrl = data[@"url"];
+        BOOL invalidated = NO;
         
         for (TUConversationLink* link in links) {
-            if ([[[link URL] absoluteString] isEqualToString:data[@"url"]]) {
-                [[[TUConversationManagerXPCClient alloc] init] invalidateLink:link completionHandler:^(char arg0, NSError* arg1) {
-                    if (transaction != nil) {
-                        [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction}];
-                    }
-                }];
+            if ([[[link URL] absoluteString] isEqualToString:targetUrl]) {
+                if ([manager respondsToSelector:@selector(invalidateLink:completionHandler:)]) {
+                    [manager invalidateLink:link completionHandler:^(char arg0, NSError* arg1) {
+                        if (transaction != nil) {
+                            [replyController sendMessage:@{@"transactionId": transaction}];
+                        }
+                    }];
+                } else {
+                    TUConversationManagerXPCClient *client = [[TUConversationManagerXPCClient alloc] init];
+                    [client invalidateLink:link completionHandler:^(char arg0, NSError* arg1) {
+                        if (transaction != nil) {
+                            [replyController sendMessage:@{@"transactionId": transaction}];
+                        }
+                    }];
+                }
+                invalidated = YES;
                 break;
             }
+        }
+        if (!invalidated && transaction != nil) {
+            [replyController sendMessage:@{@"transactionId": transaction, @"error": @"Link not found to invalidate!"}];
         }
     } else if ([event isEqualToString:@"start-call"]) {
         NetworkController *replyController = controller ?: [NetworkController sharedInstance];

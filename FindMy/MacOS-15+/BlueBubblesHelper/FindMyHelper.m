@@ -8,6 +8,7 @@
 #import "FindMyDevicesRefreshCoordinator.h"
 #import "FindMyFriendPayload.h"
 #import "FindMyFriendsRefreshCoordinator.h"
+#import "FindMyPeopleFocusController.h"
 #import "ServerConnection.h"
 
 static const NSTimeInterval BBConnectionDelaySeconds = 5.0;
@@ -89,12 +90,14 @@ static os_log_t helperLog;
     );
 
     [[FindMyDevicesDataSourceCapture sharedInstance] installCapture];
+    [[FindMyPeopleFocusController sharedInstance] installCapture];
 
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(BBConnectionDelaySeconds * NSEC_PER_SEC)),
         dispatch_get_main_queue(),
         ^{
             [[FindMyDevicesDataSourceCapture sharedInstance] installCapture];
+            [[FindMyPeopleFocusController sharedInstance] installCapture];
             [[ServerConnection sharedInstance] connect];
         }
     );
@@ -404,6 +407,34 @@ static os_log_t helperLog;
     }
 }
 
+- (NSArray<NSString *> *)focusTargetsFromData:(nullable NSDictionary *)data {
+    if (![data isKindOfClass:[NSDictionary class]]) {
+        return @[];
+    }
+    NSMutableArray<NSString *> *targets = [[NSMutableArray alloc] init];
+    NSArray<NSString *> *stringKeys = @[@"handle", @"displayName", @"name", @"fullName"];
+    for (NSString *key in stringKeys) {
+        id val = data[key];
+        if ([val isKindOfClass:[NSString class]]) {
+            NSString *trimmed = [(NSString *)val stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (trimmed.length > 0 && ![targets containsObject:trimmed]) {
+                [targets addObject:trimmed];
+            }
+        }
+    }
+    if ([data[@"handles"] isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)data[@"handles"]) {
+            if ([item isKindOfClass:[NSString class]]) {
+                NSString *trimmed = [(NSString *)item stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (trimmed.length > 0 && ![targets containsObject:trimmed]) {
+                    [targets addObject:trimmed];
+                }
+            }
+        }
+    }
+    return targets;
+}
+
 - (void)handleStartLiveLocationForTransactionIdentifier:(nullable NSString *)transactionIdentifier
                                                    data:(nullable NSDictionary *)data {
     NSString *rawHandle = [data[@"handle"] isKindOfClass:[NSString class]] ? data[@"handle"] : nil;
@@ -419,7 +450,11 @@ static os_log_t helperLog;
         return;
     }
 
+    NSArray<NSString *> *focusTargets = [self focusTargetsFromData:data];
+
     dispatch_async(dispatch_get_main_queue(), ^{
+        [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:focusTargets];
+
         FindMyLocateSession *session = [self locateSession];
         if (session == nil) {
             [self sendError:@"FindMyLocateSession is unavailable" transactionIdentifier:transactionIdentifier];
@@ -531,12 +566,18 @@ static os_log_t helperLog;
                 }
             );
 
+            NSString *canonicalHandle = [FindMyFriendPayload identifierForHandle:targetHandleObject];
+            if (canonicalHandle.length > 0 && ![focusTargets containsObject:canonicalHandle]) {
+                NSArray<NSString *> *updatedTargets = [focusTargets arrayByAddingObject:canonicalHandle];
+                [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:updatedTargets];
+            }
+
             if (transactionIdentifier != nil) {
-                NSString *canonicalHandle = [FindMyFriendPayload identifierForHandle:targetHandleObject] ?: trimmedHandle;
+                NSString *responseHandle = canonicalHandle ?: trimmedHandle;
                 [[ServerConnection sharedInstance] sendMessage:@{
                     @"transactionId": transactionIdentifier,
                     @"live": @YES,
-                    @"handle": canonicalHandle,
+                    @"handle": responseHandle,
                     @"locations": cachedPayload != nil ? @[cachedPayload] : @[],
                 }];
             }
@@ -596,9 +637,24 @@ static os_log_t helperLog;
     }
 
     NSString *rawHandle = [data[@"handle"] isKindOfClass:[NSString class]] ? data[@"handle"] : nil;
+    if (rawHandle == nil && [data[@"handles"] isKindOfClass:[NSArray class]]) {
+        for (id item in (NSArray *)data[@"handles"]) {
+            if ([item isKindOfClass:[NSString class]]) {
+                NSString *candidate = [(NSString *)item stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                if (candidate.length > 0) {
+                    rawHandle = candidate;
+                    break;
+                }
+            }
+        }
+    }
     NSString *trimmedHandle = [rawHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSString *focusedHandle = trimmedHandle.length > 0 ? trimmedHandle : nil;
-    BOOL targetedOnly = focusedHandle != nil;
+    NSArray<NSString *> *focusTargets = [self focusTargetsFromData:data];
+    BOOL targetedOnly = focusedHandle != nil || focusTargets.count > 0;
+    if (targetedOnly && focusTargets.count > 0) {
+        [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:focusTargets];
+    }
     NSString *normalizedFocusKey = focusedHandle.lowercaseString;
     if (normalizedFocusKey != nil) {
         @synchronized (self.inFlightRefreshHandleCounts) {

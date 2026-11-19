@@ -10,6 +10,7 @@
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <dlfcn.h>
 #import <pwd.h>
 #import <unistd.h>
@@ -1062,6 +1063,8 @@ static void SendTransactionResponse(NSString *transaction, NSDictionary *extra) 
     if([@"-laugh" isEqualToString:(lowerCaseType)]) return 3003;
     if([@"-emphasize" isEqualToString:(lowerCaseType)]) return 3004;
     if([@"-question" isEqualToString:(lowerCaseType)]) return 3005;
+    if([@"emoji" isEqualToString:(lowerCaseType)]) return 2006;
+    if([@"-emoji" isEqualToString:(lowerCaseType)]) return 3006;
     return 0;
 }
 
@@ -1508,11 +1511,15 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
         ddScan = [data[@"ddScan"] integerValue] == 1;
     }
 
-    void (^createMessage)(NSAttributedString*, NSAttributedString*, NSString*, NSString*, NSString*, long long*, NSRange, NSDictionary*, NSArray*, BOOL, BOOL) = ^(NSAttributedString *message, NSAttributedString *subject, NSString *effectId, NSString *threadIdentifier, NSString *associatedMessageGuid, long long *reaction, NSRange range, NSDictionary *summaryInfo, NSArray *transferGUIDs, BOOL isAudioMessage, BOOL ddScan) {
+    void (^createMessage)(NSAttributedString*, NSAttributedString*, NSString*, NSString*, IMMessage*, NSString*, long long*, NSRange, NSDictionary*, NSArray*, BOOL, BOOL) = ^(NSAttributedString *message, NSAttributedString *subject, NSString *effectId, NSString *threadIdentifier, IMMessage *threadOriginator, NSString *associatedMessageGuid, long long *reaction, NSRange range, NSDictionary *summaryInfo, NSArray *transferGUIDs, BOOL isAudioMessage, BOOL ddScan) {
         IMMessage *messageToSend = [[IMMessage alloc] init];
         if (reaction == nil) {
             messageToSend = [messageToSend initWithSender:(nil) time:(nil) text:(message) messageSubject:(subject) fileTransferGUIDs:(transferGUIDs) flags:(isAudioMessage ? 0x300005 : (subject ? 0x10000d : 0x100005)) error:(nil) guid:(nil) subject:(nil) balloonBundleID:(nil) payloadData:(nil) expressiveSendStyleID:(effectId)];
             messageToSend.threadIdentifier = threadIdentifier;
+            // RCS inline replies require threadOriginator in addition to threadIdentifier on macOS 15+.
+            if (threadOriginator != nil && [messageToSend respondsToSelector:@selector(setThreadOriginator:)]) {
+                [messageToSend performSelector:@selector(setThreadOriginator:) withObject:threadOriginator];
+            }
         } else {
             messageToSend = [messageToSend initWithSender:(nil) time:(nil) text:(message) messageSubject:(subject) fileTransferGUIDs:(nil) flags:(0x5) error:(nil) guid:(nil) subject:(nil) associatedMessageGUID:(associatedMessageGuid) associatedMessageType:*(reaction) associatedMessageRange:(range) messageSummaryInfo:(summaryInfo)];
         }
@@ -1583,45 +1590,105 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
                 // IMCreateThreadIdentifierForMessagePartChatItem().
                 item = (IMMessagePartChatItem *)items;
             }
+            // Fallback for RCS/single-part messages whose part index wasn't matched above.
+            if (item == nil && [items isKindOfClass:[NSArray class]]) {
+                for (id i in (NSArray *)items) {
+                    if ([i isKindOfClass:[IMMessagePartChatItem class]]) {
+                        item = (IMMessagePartChatItem *)i;
+                        break;
+                    }
+                }
+            }
             if (data[@"reactionType"] != [NSNull null] && [data[@"reactionType"] length] != 0) {
                 NSString *reaction = data[@"reactionType"];
                 long long reactionLong = [BlueBubblesHelper parseReactionType:(reaction)];
-                NSDictionary *messageSummary;
-                if (item != nil) {
-                    NSAttributedString *text = [item text];
-                    if (text == nil) {
-                        text = [message text];
-                    }
-                    messageSummary = @{@"amc":@1,@"ams":text.string ?: @""};
-                    // Send the tapback
-                    // check if the body happens to be an object (ie an attachment) and send the tapback accordingly to show the proper summary
-                    NSData *dataenc = [text.string dataUsingEncoding:NSNonLossyASCIIStringEncoding];
-                    NSString *encodevalue = [[NSString alloc]initWithData:dataenc encoding:NSUTF8StringEncoding];
-                    if ([encodevalue isEqualToString:@"\\ufffc"]) {
-                        NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:(@"an attachment")]];
-                        createMessage(newAttributedString, subjectAttributedString, effectId, nil, [NSString stringWithFormat:@"p:%@/%@", @(partIndex), [message guid]], &reactionLong, [item messagePartRange], @{}, nil, false, ddScan);
+                NSString *emojiStr = (data[@"emoji"] != nil && [data[@"emoji"] isKindOfClass:[NSString class]]) ? data[@"emoji"] : nil;
+
+                // Use native IMTapbackSender on macOS 15+ so RCS and iMessage tapbacks (classic + emoji)
+                // go through Apple's native Messages pipeline with proper ampt/GUID formatting.
+                Class tapbackSenderCls = NSClassFromString(@"IMTapbackSender");
+                BOOL sentViaNativeTapback = NO;
+                if (tapbackSenderCls != nil && reactionLong != 0) {
+                    id tapback = nil;
+                    if (reactionLong == 2006 || reactionLong == 3006) {
+                        Class emojiTapbackCls = NSClassFromString(@"IMEmojiTapback");
+                        if (emojiTapbackCls != nil && emojiStr.length > 0 && [emojiTapbackCls instancesRespondToSelector:@selector(initWithEmoji:isRemoved:)]) {
+                            tapback = ((id (*)(id, SEL, NSString *, BOOL))objc_msgSend)([emojiTapbackCls alloc], @selector(initWithEmoji:isRemoved:), emojiStr, (reactionLong == 3006));
+                        }
                     } else {
-                        NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:([NSString stringWithFormat:(@"“%@”"), text.string ?: @""])]];
-                        if ([item text] == nil) {
-                            createMessage(newAttributedString, subjectAttributedString, effectId, nil, [NSString stringWithFormat:@"bp:%@", [message guid]], &reactionLong, [item messagePartRange], messageSummary, nil, false, ddScan);
-                        } else {
-                            createMessage(newAttributedString, subjectAttributedString, effectId, nil, [NSString stringWithFormat:@"p:%@/%@", @(partIndex), [message guid]], &reactionLong, [item messagePartRange], messageSummary, nil, false, ddScan);
+                        Class classicTapbackCls = NSClassFromString(@"IMClassicTapback");
+                        if (classicTapbackCls != nil && [classicTapbackCls instancesRespondToSelector:@selector(initWithAssociatedMessageType:)]) {
+                            tapback = ((id (*)(id, SEL, long long))objc_msgSend)([classicTapbackCls alloc], @selector(initWithAssociatedMessageType:), reactionLong);
                         }
                     }
-                } else {
-                    NSString *fallbackText = [message text].string ?: @"";
-                    messageSummary = @{@"amc":@1,@"ams":fallbackText};
-                    // Send the tapback
-                    // check if the body happens to be an object (ie an attachment) and send the tapback accordingly to show the proper summary
-                    NSData *dataenc = [fallbackText dataUsingEncoding:NSNonLossyASCIIStringEncoding];
-                    NSString *encodevalue = [[NSString alloc]initWithData:dataenc encoding:NSUTF8StringEncoding];
-                    NSRange range = NSMakeRange(0, fallbackText.length);
-                    if ([encodevalue isEqualToString:@"\\ufffc"] || [encodevalue length] == 0) {
-                        NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:(@"an attachment")]];
-                        createMessage(newAttributedString, subjectAttributedString, effectId, nil, [message guid], &reactionLong, range, @{}, nil, false, ddScan);
+
+                    if (tapback != nil) {
+                        id senderObj = nil;
+                        if (item != nil && [tapbackSenderCls instancesRespondToSelector:@selector(initWithTapback:chat:messagePartChatItem:)]) {
+                            senderObj = ((id (*)(id, SEL, id, id, id))objc_msgSend)([tapbackSenderCls alloc], @selector(initWithTapback:chat:messagePartChatItem:), tapback, chat, item);
+                        } else if ([tapbackSenderCls instancesRespondToSelector:@selector(initWithTapback:chat:messageGUID:messagePartRange:messageSummaryInfo:threadIdentifier:)]) {
+                            NSString *fbText = [message text].string ?: @"";
+                            NSRange fbRange = NSMakeRange(0, fbText.length);
+                            NSDictionary *fbSummary = @{@"amc": @1, @"ams": fbText};
+                            senderObj = ((id (*)(id, SEL, id, id, NSString *, NSRange, NSDictionary *, NSString *))objc_msgSend)(
+                                [tapbackSenderCls alloc],
+                                @selector(initWithTapback:chat:messageGUID:messagePartRange:messageSummaryInfo:threadIdentifier:),
+                                tapback,
+                                chat,
+                                [message guid],
+                                fbRange,
+                                fbSummary,
+                                message.threadIdentifier
+                            );
+                        }
+                        if (senderObj != nil && [senderObj respondsToSelector:@selector(send)]) {
+                            id rawSentGuid = ((id (*)(id, SEL))objc_msgSend)(senderObj, @selector(send));
+                            sentViaNativeTapback = YES;
+                            if (transaction != nil) {
+                                NSString *sentGuid = [rawSentGuid isKindOfClass:[NSString class]] ? (NSString *)rawSentGuid : nil;
+                                if (sentGuid.length == 0) {
+                                    sentGuid = [[chat lastSentMessage] guid];
+                                }
+                                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"identifier": (sentGuid ?: @"")}];
+                            }
+                        }
+                    }
+                }
+
+                if (!sentViaNativeTapback) {
+                    NSDictionary *messageSummary;
+                    if (item != nil) {
+                        NSAttributedString *text = [item text];
+                        if (text == nil) {
+                            text = [message text];
+                        }
+                        messageSummary = @{@"amc":@1,@"ams":text.string ?: @""};
+                        NSData *dataenc = [text.string dataUsingEncoding:NSNonLossyASCIIStringEncoding];
+                        NSString *encodevalue = [[NSString alloc]initWithData:dataenc encoding:NSUTF8StringEncoding];
+                        if ([encodevalue isEqualToString:@"\\ufffc"]) {
+                            NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:(@"an attachment")]];
+                            createMessage(newAttributedString, subjectAttributedString, effectId, nil, nil, [NSString stringWithFormat:@"p:%@/%@", @(partIndex), [message guid]], &reactionLong, [item messagePartRange], @{}, nil, false, ddScan);
+                        } else {
+                            NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:([NSString stringWithFormat:(@"“%@”"), text.string ?: @""])]];
+                            if ([item text] == nil) {
+                                createMessage(newAttributedString, subjectAttributedString, effectId, nil, nil, [NSString stringWithFormat:@"bp:%@", [message guid]], &reactionLong, [item messagePartRange], messageSummary, nil, false, ddScan);
+                            } else {
+                                createMessage(newAttributedString, subjectAttributedString, effectId, nil, nil, [NSString stringWithFormat:@"p:%@/%@", @(partIndex), [message guid]], &reactionLong, [item messagePartRange], messageSummary, nil, false, ddScan);
+                            }
+                        }
                     } else {
-                        NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:([NSString stringWithFormat:(@"“%@”"), fallbackText])]];
-                        createMessage(newAttributedString, subjectAttributedString, effectId, nil, [message guid], &reactionLong, range, messageSummary, nil, false, ddScan);
+                        NSString *fallbackText = [message text].string ?: @"";
+                        messageSummary = @{@"amc":@1,@"ams":fallbackText};
+                        NSData *dataenc = [fallbackText dataUsingEncoding:NSNonLossyASCIIStringEncoding];
+                        NSString *encodevalue = [[NSString alloc]initWithData:dataenc encoding:NSUTF8StringEncoding];
+                        NSRange range = NSMakeRange(0, fallbackText.length);
+                        if ([encodevalue isEqualToString:@"\\ufffc"] || [encodevalue length] == 0) {
+                            NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:(@"an attachment")]];
+                            createMessage(newAttributedString, subjectAttributedString, effectId, nil, nil, [message guid], &reactionLong, range, @{}, nil, false, ddScan);
+                        } else {
+                            NSMutableAttributedString *newAttributedString = [[NSMutableAttributedString alloc] initWithString: [[BlueBubblesHelper reactionToVerb:(reaction)] stringByAppendingString:([NSString stringWithFormat:(@"“%@”"), fallbackText])]];
+                            createMessage(newAttributedString, subjectAttributedString, effectId, nil, nil, [message guid], &reactionLong, range, messageSummary, nil, false, ddScan);
+                        }
                     }
                 }
             } else {
@@ -1637,11 +1704,15 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
                     identifier = IMCreateThreadIdentifierForMessagePartChatItem(item);
                 }
                 if (identifier.length == 0) identifier = nil;
-                createMessage(attributedString, subjectAttributedString, effectId, identifier, nil, nil, NSMakeRange(0, 0), nil, transfers, isAudioMessage, ddScan);
+                IMMessage *rootOriginator = nil;
+                if (identifier != nil) {
+                    rootOriginator = ([message respondsToSelector:@selector(threadOriginator)] && message.threadOriginator != nil) ? message.threadOriginator : message;
+                }
+                createMessage(attributedString, subjectAttributedString, effectId, identifier, rootOriginator, nil, nil, NSMakeRange(0, 0), nil, transfers, isAudioMessage, ddScan);
             }
         }];
     } else {
-        createMessage(attributedString, subjectAttributedString, effectId, nil, nil, nil, NSMakeRange(0, 0), nil, transfers, isAudioMessage, ddScan);
+        createMessage(attributedString, subjectAttributedString, effectId, nil, nil, nil, nil, NSMakeRange(0, 0), nil, transfers, isAudioMessage, ddScan);
     }
 }
 

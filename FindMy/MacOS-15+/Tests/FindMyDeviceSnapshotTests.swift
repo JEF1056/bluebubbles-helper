@@ -191,12 +191,122 @@ private func testUnidentifiableDeviceMakesResponsePartial() {
     assert(response["skippedDevices"] as? Int == 1, "skipped private records must be counted")
 }
 
+private struct MockFMFFriend {
+    let identifier: String
+    let contactHandles: Set<String>
+    let displayName: String
+}
+
+private struct MockFMPeopleCellViewModel {
+    let fullName: String
+    let identifier: String
+}
+
+private final class MockFMFManager {
+    let friends: [MockFMFFriend]
+    init(friends: [MockFMFFriend]) {
+        self.friends = friends
+    }
+}
+
+private final class MockFMPeopleProvider {
+    let fmfManager: MockFMFManager
+    init(fmfManager: MockFMFManager) {
+        self.fmfManager = fmfManager
+    }
+}
+
+private final class MockFMConditionProvider: NSObject {
+    var isFrontmostWindow = false
+    var isWindowVisible = false
+}
+
+private final class MockPeopleMediator: NSObject {
+    let peopleProvider: MockFMPeopleProvider
+    let conditionProvider: MockFMConditionProvider
+    init(peopleProvider: MockFMPeopleProvider, conditionProvider: MockFMConditionProvider) {
+        self.peopleProvider = peopleProvider
+        self.conditionProvider = conditionProvider
+    }
+}
+
+private final class MockFMPeopleListDataSource: NSObject {
+    let tableView: NSObject
+    let delegate: NSObject
+    let mediator: MockPeopleMediator
+    let meCellViewModel: [MockFMPeopleCellViewModel]
+    let fenceCellModels: [MockFMPeopleCellViewModel]
+    let cellsViewModel: [MockFMPeopleCellViewModel]
+
+    init(
+        tableView: NSObject,
+        delegate: NSObject,
+        mediator: MockPeopleMediator,
+        meCellViewModel: [MockFMPeopleCellViewModel],
+        fenceCellModels: [MockFMPeopleCellViewModel],
+        cellsViewModel: [MockFMPeopleCellViewModel]
+    ) {
+        self.tableView = tableView
+        self.delegate = delegate
+        self.mediator = mediator
+        self.meCellViewModel = meCellViewModel
+        self.fenceCellModels = fenceCellModels
+        self.cellsViewModel = cellsViewModel
+    }
+}
+
+private func testPeopleRowsMetadataExtraction() {
+    let tableView = NSObject()
+    let delegate = NSObject()
+    let conditionProvider = MockFMConditionProvider()
+    let fmfManager = MockFMFManager(friends: [
+        MockFMFFriend(
+            identifier: "friend-uuid-1",
+            contactHandles: ["+15551234567", "alice@icloud.com"],
+            displayName: "Alice Appleseed"
+        ),
+    ])
+    let dataSource = MockFMPeopleListDataSource(
+        tableView: tableView,
+        delegate: delegate,
+        mediator: MockPeopleMediator(
+            peopleProvider: MockFMPeopleProvider(fmfManager: fmfManager),
+            conditionProvider: conditionProvider
+        ),
+        meCellViewModel: [MockFMPeopleCellViewModel(fullName: "Me", identifier: "me-id")],
+        fenceCellModels: [],
+        cellsViewModel: [
+            MockFMPeopleCellViewModel(fullName: "Bob Builder", identifier: "friend-uuid-2"),
+            MockFMPeopleCellViewModel(fullName: "Alice Appleseed", identifier: "friend-uuid-1"),
+        ]
+    )
+
+    let metadata = FindMyDeviceSnapshot.peopleRowsMetadata(from: dataSource)
+    assert(metadata["tableView"] as? NSObject === tableView, "tableView must be extracted")
+    assert(metadata["delegate"] as? NSObject === delegate, "delegate must be extracted")
+    assert(metadata["conditionProvider"] as? MockFMConditionProvider === conditionProvider,
+           "conditionProvider must be extracted")
+
+    let friends = metadata["friends"] as? [[String]]
+    assert(friends?.count == 1, "FMFManager friends must be extracted")
+    assert(friends?[0].contains("+15551234567") == true, "friend contactHandles must be collected")
+
+    let rows = metadata["rows"] as? [[String: Any]]
+    assert(rows?.count == 3, "meCellViewModel (sec 0) and cellsViewModel (sec 2) rows must be extracted")
+    assert(rows?[0]["section"] as? Int == 0 && rows?[0]["row"] as? Int == 0, "me row maps to section 0")
+    assert(rows?[2]["section"] as? Int == 2 && rows?[2]["row"] as? Int == 1, "friend row 1 maps to section 2 row 1")
+    let aliceTokens = rows?[2]["tokens"] as? [String] ?? []
+    assert(aliceTokens.contains("Alice Appleseed") && aliceTokens.contains("friend-uuid-1"),
+           "friend cell tokens must preserve display name and identifier")
+}
+
 @main
 private enum FindMyDeviceSnapshotTests {
     static func main() {
         testPopulatedAndOfflineDevices()
         testUnavailableAndEmptyCollections()
         testUnidentifiableDeviceMakesResponsePartial()
+        testPeopleRowsMetadataExtraction()
         print("PASS: FindMyDeviceSnapshotTests")
     }
 }

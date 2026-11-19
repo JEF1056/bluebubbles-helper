@@ -82,6 +82,7 @@ xcrun --sdk macosx clang \
     "$SOURCE_DIR/FindMyDevicesRefreshCoordinator.m" \
     "$SOURCE_DIR/FindMyFriendsRefreshCoordinator.m" \
     "$SOURCE_DIR/FindMyDeviceSnapshotBridge.m" \
+    "$SOURCE_DIR/FindMyPeopleFocusController.m" \
     "$SOURCE_DIR/FindMyHelper.m" \
     "$SOURCE_DIR/ServerConnection.m" \
     "$SOCKET_DIR/GCDAsyncSocket.m" \

@@ -291,6 +291,150 @@ enum FindMyDeviceSnapshot {
         let rightIdentifier = right["identifier"] as? String ?? ""
         return leftIdentifier < rightIdentifier
     }
+
+    static func peopleRowsMetadata(from dataSource: Any) -> [String: Any] {
+        var result: [String: Any] = [:]
+
+        if let tableView = child(named: "tableView", in: dataSource) {
+            result["tableView"] = tableView
+        }
+        if let delegate = child(named: "delegate", in: dataSource) {
+            result["delegate"] = delegate
+        }
+
+        var friendTokenGroups: [[String]] = []
+        if let mediator = child(named: "mediator", in: dataSource) {
+            result["mediator"] = mediator
+            if let conditionProvider = child(named: "conditionProvider", in: mediator) {
+                result["conditionProvider"] = conditionProvider
+            }
+            if let peopleProvider = child(named: "peopleProvider", in: mediator),
+               let fmfManager = child(named: "fmfManager", in: peopleProvider),
+               let friends = child(named: "friends", in: fmfManager) {
+                for friend in collectionElements(friends) {
+                    let tokens = collectStringTokens(from: friend, maxDepth: 5)
+                    if !tokens.isEmpty {
+                        friendTokenGroups.append(tokens)
+                    }
+                }
+            }
+        }
+        result["friends"] = friendTokenGroups
+
+        // FMPeopleListDataSource section mapping: 0 = meCellViewModel, 1 = fenceCellModels, 2 = cellsViewModel.
+        let sectionSources: [(Int, String)] = [
+            (0, "meCellViewModel"),
+            (1, "fenceCellModels"),
+            (2, "cellsViewModel"),
+        ]
+        var rows: [[String: Any]] = []
+        for (section, ivarName) in sectionSources {
+            guard let sectionValue = child(named: ivarName, in: dataSource) else {
+                continue
+            }
+            for (rowIndex, element) in collectionElements(sectionValue).enumerated() {
+                rows.append([
+                    "section": section,
+                    "row": rowIndex,
+                    "tokens": collectStringTokens(from: element, maxDepth: 5),
+                ])
+            }
+        }
+        result["rows"] = rows
+        return result
+    }
+
+    private static func collectionElements(_ value: Any?) -> [Any] {
+        guard let unwrappedValue = unwrapped(value) else {
+            return []
+        }
+        let mirror = Mirror(reflecting: unwrappedValue)
+        if mirror.displayStyle == .collection || mirror.displayStyle == .set {
+            return mirror.children.map { $0.value }
+        }
+        return [unwrappedValue]
+    }
+
+    private static func collectStringTokens(from value: Any?, maxDepth: Int) -> [String] {
+        var tokens: [String] = []
+        var seenTokens: Set<String> = []
+        var visitedObjects: Set<ObjectIdentifier> = []
+        appendStringTokens(
+            from: value,
+            depth: 0,
+            maxDepth: maxDepth,
+            tokens: &tokens,
+            seenTokens: &seenTokens,
+            visitedObjects: &visitedObjects
+        )
+        return tokens
+    }
+
+    private static func appendStringTokens(
+        from value: Any?,
+        depth: Int,
+        maxDepth: Int,
+        tokens: inout [String],
+        seenTokens: inout Set<String>,
+        visitedObjects: inout Set<ObjectIdentifier>
+    ) {
+        guard let unwrappedValue = unwrapped(value) else {
+            return
+        }
+        if let str = string(unwrappedValue) {
+            if seenTokens.insert(str).inserted {
+                tokens.append(str)
+            }
+            return
+        }
+        guard depth < maxDepth else {
+            return
+        }
+
+        let mirror = Mirror(reflecting: unwrappedValue)
+        if mirror.displayStyle == .collection || mirror.displayStyle == .set {
+            for child in mirror.children.prefix(64) {
+                appendStringTokens(
+                    from: child.value,
+                    depth: depth + 1,
+                    maxDepth: maxDepth,
+                    tokens: &tokens,
+                    seenTokens: &seenTokens,
+                    visitedObjects: &visitedObjects
+                )
+            }
+            return
+        }
+
+        if mirror.displayStyle == .class {
+            let objectID = ObjectIdentifier(unwrappedValue as AnyObject)
+            if !visitedObjects.insert(objectID).inserted {
+                return
+            }
+        }
+
+        let ignoredLabels: Set<String> = [
+            "tableView", "delegate", "mediator", "updateQueue", "delayedUpdateWorkItem",
+            "cancellables", "subscriptions", "avatar", "image", "cachedImage", "icon",
+        ]
+        var currentMirror: Mirror? = mirror
+        while let activeMirror = currentMirror {
+            for child in activeMirror.children {
+                if let label = child.label, ignoredLabels.contains(label) {
+                    continue
+                }
+                appendStringTokens(
+                    from: child.value,
+                    depth: depth + 1,
+                    maxDepth: maxDepth,
+                    tokens: &tokens,
+                    seenTokens: &seenTokens,
+                    visitedObjects: &visitedObjects
+                )
+            }
+            currentMirror = activeMirror.superclassMirror
+        }
+    }
 }
 
 @_cdecl("BlueBubblesFindMyCopyDevicesSnapshot")
@@ -305,4 +449,17 @@ public func blueBubblesFindMyCopyDevicesSnapshot(
     let dataSource = Unmanaged<AnyObject>.fromOpaque(dataSourcePointer).takeUnretainedValue()
     let response = FindMyDeviceSnapshot.response(from: dataSource)
     return Unmanaged.passRetained(response as NSDictionary).toOpaque()
+}
+
+@_cdecl("BlueBubblesFindMyCopyPeopleRowsMetadata")
+public func blueBubblesFindMyCopyPeopleRowsMetadata(
+    _ dataSourcePointer: UnsafeMutableRawPointer?
+) -> UnsafeMutableRawPointer? {
+    guard let dataSourcePointer else {
+        return Unmanaged.passRetained(([:] as NSDictionary)).toOpaque()
+    }
+
+    let dataSource = Unmanaged<AnyObject>.fromOpaque(dataSourcePointer).takeUnretainedValue()
+    let metadata = FindMyDeviceSnapshot.peopleRowsMetadata(from: dataSource)
+    return Unmanaged.passRetained(metadata as NSDictionary).toOpaque()
 }

@@ -57,6 +57,7 @@
 @property (nonatomic, copy) NSString *endedErrorString;
 @property (nonatomic, copy) NSString *endedReasonString;
 @property (nonatomic, strong) TUHandle *handle;
+@property (nonatomic, copy) NSArray *remoteParticipantHandles;
 @property (nonatomic) BOOL isSendingAudio;
 @property (nonatomic) BOOL isSendingVideo;
 @property (nonatomic, getter=isOutgoing) BOOL outgoing;
@@ -291,6 +292,42 @@ static void TestSetMuted(BLUEBUBBLESFACETIMEHELPER *helper) {
     printf("PASS: TestSetMuted\n");
 }
 
+static void TestGenerateLink(BLUEBUBBLESFACETIMEHELPER *helper) {
+    MockNetworkController *nc = [[MockNetworkController alloc] init];
+    
+    // 1. Generic link path when callUUID is null: uses async sharedConversationManager without spurious sync error
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"generate-link",
+        @"transactionId": @"tx-g1",
+        @"data": @{@"callUUID": [NSNull null]}
+    })];
+    AssertTrue(nc.sentMessages.count == 0 || nc.sentMessages.lastObject[@"error"] != nil, @"Expected async generic link or clean unsupported error");
+
+    // 2. Inactive call error reply test
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"generate-link",
+        @"transactionId": @"tx-g2",
+        @"data": @{@"callUUID": @"non-existent-uuid"}
+    })];
+    AssertTrue([nc.sentMessages.lastObject[@"error"] isEqualToString:@"Call is no longer active!"], @"Expected inactive call error");
+
+    // 3. Valid active call enters polling/link-generation without immediate inactive-call error
+    MockCall *activeCall = [[MockCall alloc] init];
+    activeCall.callUUID = @"valid-uuid";
+    activeCall.callStatus = 3; // Dialing/Ringing
+    gMockCalls[@"valid-uuid"] = activeCall;
+    NSUInteger beforeCount = nc.sentMessages.count;
+
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"generate-link",
+        @"transactionId": @"tx-g3",
+        @"data": @{@"callUUID": @"valid-uuid"}
+    })];
+    AssertTrue([helper respondsToSelector:@selector(sharedConversationManager)], @"Expected helper to respond to sharedConversationManager");
+    AssertTrue(nc.sentMessages.count == beforeCount, @"Expected active call generate-link to poll asynchronously rather than fail synchronously");
+    printf("PASS: TestGenerateLink\n");
+}
+
 static void TestStartCall(BLUEBUBBLESFACETIMEHELPER *helper) {
     MockNetworkController *nc = [[MockNetworkController alloc] init];
 
@@ -377,6 +414,7 @@ int main(void) {
         TestDeclineAndLeaveCall(helper);
         TestSetMuted(helper);
         TestStartCall(helper);
+        TestGenerateLink(helper);
         printf("ALL FACETIME HELPER TESTS PASSED\n");
     }
     return 0;
