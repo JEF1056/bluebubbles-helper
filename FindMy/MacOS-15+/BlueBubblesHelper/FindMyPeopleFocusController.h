@@ -11,7 +11,6 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)installCapture;
 
 - (void)scheduleFocusPeopleTabAndSelectTargets:(NSArray<NSString *> *)targets;
-- (BOOL)focusPeopleTabAndSelectTargets:(NSArray<NSString *> *)targets;
 - (BOOL)focusPeopleTabAndSelectTargets:(NSArray<NSString *> *)targets
                          inRootObjects:(nullable NSArray *)rootObjects;
 

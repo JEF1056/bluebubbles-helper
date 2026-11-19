@@ -56,7 +56,7 @@ static NSString *BBExtractCallUUID(NSDictionary *data) {
 - (void)handleMessage:(NetworkController *)controller message:(NSString *)message;
 - (TUConversationManager *)sharedConversationManager;
 - (void)sendGeneratedLinkReply:(TUConversationLink *)link error:(NSError *)error transaction:(NSString *)transaction replyController:(NetworkController *)replyController;
-- (void)generateLinkForCallUUID:(NSString *)callUUID attemptsLeft:(NSInteger)attemptsLeft linkRetriesLeft:(NSInteger)linkRetriesLeft transaction:(NSString *)transaction replyController:(NetworkController *)replyController;
+- (void)generateLinkForCallUUID:(NSString *)callUUID attemptsLeft:(NSInteger)attemptsLeft linkRetriesLeft:(NSInteger)linkRetriesLeft deadline:(NSDate *)deadline transaction:(NSString *)transaction replyController:(NetworkController *)replyController;
 @end
 
 // This can be used to dump the methods of any class
@@ -96,6 +96,7 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
 - (void)generateLinkForCallUUID:(NSString *)callUUID
                    attemptsLeft:(NSInteger)attemptsLeft
                 linkRetriesLeft:(NSInteger)linkRetriesLeft
+                       deadline:(NSDate *)deadline
                     transaction:(NSString *)transaction
                 replyController:(NetworkController *)replyController {
     TUCallCenter *callCenter = [TUCallCenter sharedInstance];
@@ -107,14 +108,15 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         return;
     }
 
+    NSTimeInterval remaining = deadline != nil ? [deadline timeIntervalSinceNow] : 0;
     TUConversation *convo = [callCenter activeConversationForCall:call];
     // Wait until callservicesd has joined/registered the conversation (avoids dropped XPC link completion).
     BOOL convoReady = convo != nil && (([convo respondsToSelector:@selector(hasJoined)] && [convo hasJoined]) ||
                                        ([convo respondsToSelector:@selector(state)] && [convo state] >= 2));
     if (!convoReady) {
-        if (attemptsLeft > 0) {
+        if (attemptsLeft > 0 && remaining > 0) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-                [self generateLinkForCallUUID:callUUID attemptsLeft:(attemptsLeft - 1) linkRetriesLeft:linkRetriesLeft transaction:transaction replyController:replyController];
+                [self generateLinkForCallUUID:callUUID attemptsLeft:(attemptsLeft - 1) linkRetriesLeft:linkRetriesLeft deadline:deadline transaction:transaction replyController:replyController];
             });
             return;
         }
@@ -132,14 +134,20 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         return;
     }
 
+    if (remaining <= 0) {
+        [self sendGeneratedLinkReply:nil error:nil transaction:transaction replyController:replyController];
+        return;
+    }
+
     TUConversationManager *manager = [self sharedConversationManager];
     __block BOOL handled = NO;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    NSTimeInterval attemptTimeout = MIN(5.0, remaining);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(attemptTimeout * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (handled) return;
         handled = YES;
         DLog("BLUEBUBBLESFACETIMEHELPER: generateLinkForConversation timed out (retriesLeft=%ld)", (long)linkRetriesLeft);
-        if (linkRetriesLeft > 0) {
-            [self generateLinkForCallUUID:callUUID attemptsLeft:attemptsLeft linkRetriesLeft:(linkRetriesLeft - 1) transaction:transaction replyController:replyController];
+        if (linkRetriesLeft > 0 && [deadline timeIntervalSinceNow] > 0) {
+            [self generateLinkForCallUUID:callUUID attemptsLeft:attemptsLeft linkRetriesLeft:(linkRetriesLeft - 1) deadline:deadline transaction:transaction replyController:replyController];
             return;
         }
         [self sendGeneratedLinkReply:[convo link] error:nil transaction:transaction replyController:replyController];
@@ -150,9 +158,9 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
             handled = YES;
             DLog("BLUEBUBBLESFACETIMEHELPER: generated link for call %{public}@ (err=%{public}@)", [arg0 URL], arg1);
             TUConversationLink *resolvedLink = arg0 ?: [convo link];
-            if ([[[resolvedLink URL] absoluteString] length] == 0 && linkRetriesLeft > 0) {
+            if ([[[resolvedLink URL] absoluteString] length] == 0 && linkRetriesLeft > 0 && [deadline timeIntervalSinceNow] > 0) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-                    [self generateLinkForCallUUID:callUUID attemptsLeft:attemptsLeft linkRetriesLeft:(linkRetriesLeft - 1) transaction:transaction replyController:replyController];
+                    [self generateLinkForCallUUID:callUUID attemptsLeft:attemptsLeft linkRetriesLeft:(linkRetriesLeft - 1) deadline:deadline transaction:transaction replyController:replyController];
                 });
                 return;
             }
@@ -430,7 +438,7 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         NetworkController *replyController = controller ?: [NetworkController sharedInstance];
         NSString *callUUID = BBExtractCallUUID(data);
         if (callUUID != nil) {
-            [self generateLinkForCallUUID:callUUID attemptsLeft:200 linkRetriesLeft:5 transaction:transaction replyController:replyController];
+            [self generateLinkForCallUUID:callUUID attemptsLeft:40 linkRetriesLeft:2 deadline:[NSDate dateWithTimeIntervalSinceNow:15.0] transaction:transaction replyController:replyController];
         } else {
             TUConversationManager *manager = [self sharedConversationManager];
             if (manager == nil) {
@@ -449,13 +457,22 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         }
     } else if ([event isEqualToString:@"admit-pending-member"]) {
         NetworkController *replyController = controller ?: [NetworkController sharedInstance];
+        id rawConvUUID = data[@"conversationUUID"];
+        id rawHandleUUID = data[@"handleUUID"];
+        if (![rawConvUUID isKindOfClass:[NSString class]] || [(NSString *)rawConvUUID length] == 0 ||
+            ![rawHandleUUID isKindOfClass:[NSString class]] || [(NSString *)rawHandleUUID length] == 0) {
+            if (transaction != nil) {
+                [replyController sendMessage:@{@"transactionId": transaction, @"error": @"conversationUUID and handleUUID are required!"}];
+            }
+            return;
+        }
+        NSString *targetConvUUID = (NSString *)rawConvUUID;
+        NSString *targetHandleUUID = (NSString *)rawHandleUUID;
         TUConversationManager *manager = [self sharedConversationManager];
         TUConversation *convo = nil;
-        NSString *targetConvUUID = data[@"conversationUUID"];
-        NSString *targetHandleUUID = data[@"handleUUID"];
 
         for (TUConversation *i in [self conversationCandidatesForManager:manager]) {
-            if ([[[i groupUUID] UUIDString] isEqualToString:targetConvUUID] || targetConvUUID == nil) {
+            if ([[[i groupUUID] UUIDString] isEqualToString:targetConvUUID]) {
                 convo = i;
                 break;
             }
@@ -464,7 +481,7 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         BOOL admitted = NO;
         if (convo != nil) {
             for (TUConversationMember *member in [convo pendingMembers]) {
-                if ([[[member handle] value] isEqualToString:targetHandleUUID] || targetHandleUUID == nil) {
+                if ([[[member handle] value] isEqualToString:targetHandleUUID]) {
                     [manager approvePendingMember:member forConversation:convo];
                     admitted = YES;
                     break;

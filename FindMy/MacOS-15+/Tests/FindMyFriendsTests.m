@@ -305,6 +305,8 @@ static void BBTestFriendListTimeout(void) {
     FindMyFriendsRefreshCoordinator *coordinator = [[FindMyFriendsRefreshCoordinator alloc]
         initWithSession:session
         transactionIdentifier:@"friend-list-timeout"
+        focusedHandle:nil
+        targetedOnly:NO
         friendListTimeout:0.01
         locationRefreshTimeout:0.05
         responseHandler:^(NSDictionary *response) {
@@ -330,6 +332,8 @@ static void BBTestLocationTimeoutAndLateCallbacks(void) {
     FindMyFriendsRefreshCoordinator *coordinator = [[FindMyFriendsRefreshCoordinator alloc]
         initWithSession:session
         transactionIdentifier:@"location-timeout"
+        focusedHandle:nil
+        targetedOnly:NO
         friendListTimeout:0.05
         locationRefreshTimeout:0.01
         responseHandler:^(NSDictionary *response) {
@@ -371,6 +375,8 @@ static void BBTestDuplicateImmediateCallback(void) {
     FindMyFriendsRefreshCoordinator *coordinator = [[FindMyFriendsRefreshCoordinator alloc]
         initWithSession:session
         transactionIdentifier:@"duplicate-callback"
+        focusedHandle:nil
+        targetedOnly:NO
         friendListTimeout:0.05
         locationRefreshTimeout:0.05
         responseHandler:^(NSDictionary *response) {
@@ -514,6 +520,7 @@ static void BBTestFocusedHandlePrioritizationAndLocatingState(void) {
         initWithSession:session
         transactionIdentifier:@"focused-refresh"
         focusedHandle:@"BOB@example.com"
+        targetedOnly:NO
         friendListTimeout:0.05
         locationRefreshTimeout:0.05
         responseHandler:^(NSDictionary *response) {

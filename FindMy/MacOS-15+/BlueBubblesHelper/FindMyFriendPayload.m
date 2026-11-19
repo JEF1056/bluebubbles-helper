@@ -28,6 +28,65 @@
 #pragma clang diagnostic pop
 }
 
++ (nullable id)handleForFriendRecord:(nullable id)friendRecord {
+    if (friendRecord == nil) {
+        return nil;
+    }
+    Class locationHandleClass = NSClassFromString(@"FMLHandle");
+    if (locationHandleClass != Nil) {
+        if ([friendRecord isKindOfClass:locationHandleClass]) {
+            return friendRecord;
+        }
+    } else {
+        SEL identifierSelector = NSSelectorFromString(@"identifier");
+        SEL comparisonIdentifierSelector = NSSelectorFromString(@"comparisonIdentifier");
+        if ([friendRecord respondsToSelector:identifierSelector] ||
+            [friendRecord respondsToSelector:comparisonIdentifierSelector]) {
+            return friendRecord;
+        }
+    }
+    return [self valueForSelector:NSSelectorFromString(@"handle") onObject:friendRecord];
+}
+
++ (nullable id)cachedLocationForHandle:(nullable id)locationHandle
+                               session:(nullable id<FindMyLocateSessionProtocol>)session {
+    if (locationHandle == nil || session == nil) {
+        return nil;
+    }
+    if ([session respondsToSelector:@selector(cachedLocationForHandle:includeAddress:)]) {
+        return [session cachedLocationForHandle:locationHandle includeAddress:YES];
+    }
+    if ([session respondsToSelector:@selector(cachedLocationForHandle:)]) {
+        return [session cachedLocationForHandle:locationHandle];
+    }
+    return nil;
+}
+
++ (void)startRefreshingSession:(nullable id<FindMyLocateSessionProtocol>)session
+                       handles:(NSArray *)handles
+                      priority:(long long)priority
+                    completion:(nullable FindMyCompletion)completion {
+    FindMyCompletion safeCompletion = completion ?: ^{};
+    if (session == nil || handles.count == 0) {
+        safeCompletion();
+        return;
+    }
+    if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:reverseGeocode:completion:)]) {
+        [session startRefreshingLocationForHandles:handles
+                                          priority:priority
+                                       isFromGroup:NO
+                                    reverseGeocode:YES
+                                        completion:safeCompletion];
+    } else if ([session respondsToSelector:@selector(startRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
+        [session startRefreshingLocationForHandles:handles
+                                          priority:priority
+                                       isFromGroup:NO
+                                        completion:safeCompletion];
+    } else {
+        safeCompletion();
+    }
+}
+
 + (nullable NSString *)nonEmptyString:(nullable id)value {
     if (![value isKindOfClass:[NSString class]]) {
         return nil;

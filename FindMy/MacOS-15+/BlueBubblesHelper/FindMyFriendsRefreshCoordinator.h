@@ -8,18 +8,7 @@ typedef void (^FindMyFriendsRefreshResponseHandler)(NSDictionary *response);
 
 @interface FindMyFriendsRefreshCoordinator : NSObject
 
-- (instancetype)initWithSession:(id<FindMyLocateSessionProtocol>)session
-           transactionIdentifier:(nullable NSString *)transactionIdentifier
-               friendListTimeout:(NSTimeInterval)friendListTimeout
-          locationRefreshTimeout:(NSTimeInterval)locationRefreshTimeout
-                 responseHandler:(FindMyFriendsRefreshResponseHandler)responseHandler;
-
-- (instancetype)initWithSession:(id<FindMyLocateSessionProtocol>)session
-           transactionIdentifier:(nullable NSString *)transactionIdentifier
-                   focusedHandle:(nullable NSString *)focusedHandle
-               friendListTimeout:(NSTimeInterval)friendListTimeout
-          locationRefreshTimeout:(NSTimeInterval)locationRefreshTimeout
-                 responseHandler:(FindMyFriendsRefreshResponseHandler)responseHandler;
+@property (nonatomic, assign) BOOL preserveFocusedLiveRefresh;
 
 - (instancetype)initWithSession:(id<FindMyLocateSessionProtocol>)session
            transactionIdentifier:(nullable NSString *)transactionIdentifier

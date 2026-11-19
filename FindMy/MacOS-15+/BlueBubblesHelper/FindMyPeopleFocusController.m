@@ -129,9 +129,9 @@ static id _Nullable BBIvarObjectValue(id object, const char *ivarName) {
     return nil;
 }
 
-static BOOL BBReadBoolIvar(id object, const char *ivarName, BOOL *outValue) {
+static BOOL *BBBoolIvarPtr(id object, const char *ivarName) {
     if (object == nil || ivarName == NULL) {
-        return NO;
+        return NULL;
     }
     Class cursor = object_getClass(object);
     while (cursor != Nil) {
@@ -140,38 +140,31 @@ static BOOL BBReadBoolIvar(id object, const char *ivarName, BOOL *outValue) {
             const char *encoding = ivar_getTypeEncoding(ivar);
             ptrdiff_t offset = ivar_getOffset(ivar);
             if (offset > 0 && (encoding == NULL || encoding[0] == 'B' || encoding[0] == 'c' || encoding[0] == '\0')) {
-                if (outValue != NULL) {
-                    *outValue = *(BOOL *)((uint8_t *)(__bridge void *)object + offset);
-                }
-                return YES;
+                return (BOOL *)((uint8_t *)(__bridge void *)object + offset);
             }
-            return NO;
+            return NULL;
         }
         cursor = class_getSuperclass(cursor);
     }
-    return NO;
+    return NULL;
+}
+
+static BOOL BBReadBoolIvar(id object, const char *ivarName, BOOL *outValue) {
+    BOOL *flagPtr = BBBoolIvarPtr(object, ivarName);
+    if (flagPtr == NULL) {
+        return NO;
+    }
+    if (outValue != NULL) {
+        *outValue = *flagPtr;
+    }
+    return YES;
 }
 
 static BOOL BBSetBoolIvarIfFalse(id object, const char *ivarName) {
-    if (object == nil || ivarName == NULL) {
-        return NO;
-    }
-    Class cursor = object_getClass(object);
-    while (cursor != Nil) {
-        Ivar ivar = class_getInstanceVariable(cursor, ivarName);
-        if (ivar != NULL) {
-            const char *encoding = ivar_getTypeEncoding(ivar);
-            ptrdiff_t offset = ivar_getOffset(ivar);
-            if (offset > 0 && (encoding == NULL || encoding[0] == 'B' || encoding[0] == 'c' || encoding[0] == '\0')) {
-                BOOL *flagPtr = (BOOL *)((uint8_t *)(__bridge void *)object + offset);
-                if (!(*flagPtr)) {
-                    *flagPtr = YES;
-                    return YES;
-                }
-            }
-            return NO;
-        }
-        cursor = class_getSuperclass(cursor);
+    BOOL *flagPtr = BBBoolIvarPtr(object, ivarName);
+    if (flagPtr != NULL && !(*flagPtr)) {
+        *flagPtr = YES;
+        return YES;
     }
     return NO;
 }
@@ -272,11 +265,18 @@ static BOOL BBHasLetters(NSString *value) {
             }
 
             IMP originalIMP = method_getImplementation(method);
+            const char *typeEncoding = method_getTypeEncoding(method);
             NSMutableDictionary<NSString *, NSValue *> *impMap = BBPeopleNumberOfRowsOriginalIMPs();
             @synchronized (impMap) {
                 impMap[resolvedName] = [NSValue valueWithPointer:(void *)originalIMP];
             }
-            method_setImplementation(method, (IMP)BBHookedPeopleNumberOfRowsInSection);
+            // Add override on targetClass first so inherited UITableViewDiffableDataSource methods aren't hooked globally.
+            if (!class_addMethod(targetClass, targetSelector, (IMP)BBHookedPeopleNumberOfRowsInSection, typeEncoding)) {
+                IMP replacedIMP = method_setImplementation(method, (IMP)BBHookedPeopleNumberOfRowsInSection);
+                @synchronized (impMap) {
+                    impMap[resolvedName] = [NSValue valueWithPointer:(void *)replacedIMP];
+                }
+            }
             [installedClasses addObject:resolvedName];
         }
     }
@@ -363,6 +363,48 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
     return cleaned;
 }
 
+- (NSArray<NSString *> *)targetsExpandedWithContacts:(NSArray<NSString *> *)cleanedTargets {
+    // Expand phone/email targets via Contacts when FindMy already holds authorization,
+    // since People list cells display resolved contact names rather than raw handles.
+    if ([CNContactStore authorizationStatusForEntityType:CNEntityTypeContacts] != CNAuthorizationStatusAuthorized) {
+        return cleanedTargets;
+    }
+    CNContactStore *store = [[CNContactStore alloc] init];
+    NSArray<id<CNKeyDescriptor>> *keys = @[
+        [CNContactFormatter descriptorForRequiredKeysForStyle:CNContactFormatterStyleFullName],
+        CNContactGivenNameKey,
+        CNContactFamilyNameKey,
+        CNContactNicknameKey,
+    ];
+    NSMutableArray<NSString *> *augmented = [[NSMutableArray alloc] initWithArray:cleanedTargets];
+    NSMutableSet<NSString *> *seenLower = [[NSMutableSet alloc] init];
+    for (NSString *t in cleanedTargets) {
+        [seenLower addObject:t.lowercaseString];
+    }
+    for (NSString *target in cleanedTargets) {
+        NSPredicate *predicate = [target containsString:@"@"]
+            ? [CNContact predicateForContactsMatchingEmailAddress:target]
+            : (BBDigitsOnly(target).length >= 7
+                ? [CNContact predicateForContactsMatchingPhoneNumber:[CNPhoneNumber phoneNumberWithStringValue:target]]
+                : nil);
+        if (predicate == nil) {
+            continue;
+        }
+        NSArray<CNContact *> *contacts = [store unifiedContactsMatchingPredicate:predicate keysToFetch:keys error:nil];
+        for (CNContact *contact in contacts) {
+            NSString *fullName = [CNContactFormatter stringFromContact:contact style:CNContactFormatterStyleFullName];
+            for (NSString *candidate in @[fullName ?: @"", contact.nickname ?: @""]) {
+                NSString *clean = BBCollapseWhitespace(candidate);
+                if (clean.length > 0 && ![seenLower containsObject:clean.lowercaseString]) {
+                    [seenLower addObject:clean.lowercaseString];
+                    [augmented addObject:clean];
+                }
+            }
+        }
+    }
+    return augmented;
+}
+
 - (void)scheduleFocusPeopleTabAndSelectTargets:(NSArray<NSString *> *)targets {
     NSArray<NSString *> *cleanedTargets = [self sanitizedTargets:targets];
     if (cleanedTargets.count == 0) {
@@ -373,7 +415,8 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
         [self installCapture];
         self.focusGeneration += 1;
         NSUInteger generation = self.focusGeneration;
-        [self attemptFocusWithTargets:cleanedTargets generation:generation remainingRetries:BBFocusMaxRetries];
+        NSArray<NSString *> *expandedTargets = [self targetsExpandedWithContacts:cleanedTargets];
+        [self attemptFocusWithTargets:expandedTargets generation:generation remainingRetries:BBFocusMaxRetries];
     });
 }
 
@@ -384,7 +427,7 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
         return;
     }
 
-    if ([self focusPeopleTabAndSelectTargets:targets inRootObjects:nil]) {
+    if ([self focusPeopleTabAndSelectPreparedTargets:targets inRootObjects:nil]) {
         return;
     }
 
@@ -407,13 +450,18 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
     );
 }
 
-- (BOOL)focusPeopleTabAndSelectTargets:(NSArray<NSString *> *)targets {
-    return [self focusPeopleTabAndSelectTargets:targets inRootObjects:nil];
-}
-
 - (BOOL)focusPeopleTabAndSelectTargets:(NSArray<NSString *> *)targets
                          inRootObjects:(nullable NSArray *)rootObjects {
     NSArray<NSString *> *cleanedTargets = [self sanitizedTargets:targets];
+    if (cleanedTargets.count == 0) {
+        return NO;
+    }
+    return [self focusPeopleTabAndSelectPreparedTargets:[self targetsExpandedWithContacts:cleanedTargets]
+                                          inRootObjects:rootObjects];
+}
+
+- (BOOL)focusPeopleTabAndSelectPreparedTargets:(NSArray<NSString *> *)cleanedTargets
+                                 inRootObjects:(nullable NSArray *)rootObjects {
     if (cleanedTargets.count == 0) {
         return NO;
     }
@@ -476,45 +524,6 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
     for (id sideBarVC in sideBarVCs) {
         id mediator = BBIvarObjectValue(sideBarVC, "mediator");
         [self ensureBackgroundRefreshConditionsForMediator:mediator];
-    }
-
-    // Expand phone/email targets via Contacts when FindMy already holds authorization,
-    // since People list cells display resolved contact names rather than raw handles.
-    if ([CNContactStore authorizationStatusForEntityType:CNEntityTypeContacts] == CNAuthorizationStatusAuthorized) {
-        CNContactStore *store = [[CNContactStore alloc] init];
-        NSArray<id<CNKeyDescriptor>> *keys = @[
-            [CNContactFormatter descriptorForRequiredKeysForStyle:CNContactFormatterStyleFullName],
-            CNContactGivenNameKey,
-            CNContactFamilyNameKey,
-            CNContactNicknameKey,
-        ];
-        NSMutableArray<NSString *> *augmented = [[NSMutableArray alloc] initWithArray:cleanedTargets];
-        NSMutableSet<NSString *> *seenLower = [[NSMutableSet alloc] init];
-        for (NSString *t in cleanedTargets) {
-            [seenLower addObject:t.lowercaseString];
-        }
-        for (NSString *target in cleanedTargets) {
-            NSPredicate *predicate = [target containsString:@"@"]
-                ? [CNContact predicateForContactsMatchingEmailAddress:target]
-                : (BBDigitsOnly(target).length >= 7
-                    ? [CNContact predicateForContactsMatchingPhoneNumber:[CNPhoneNumber phoneNumberWithStringValue:target]]
-                    : nil);
-            if (predicate == nil) {
-                continue;
-            }
-            NSArray<CNContact *> *contacts = [store unifiedContactsMatchingPredicate:predicate keysToFetch:keys error:nil];
-            for (CNContact *contact in contacts) {
-                NSString *fullName = [CNContactFormatter stringFromContact:contact style:CNContactFormatterStyleFullName];
-                for (NSString *candidate in @[fullName ?: @"", contact.nickname ?: @""]) {
-                    NSString *clean = BBCollapseWhitespace(candidate);
-                    if (clean.length > 0 && ![seenLower containsObject:clean.lowercaseString]) {
-                        [seenLower addObject:clean.lowercaseString];
-                        [augmented addObject:clean];
-                    }
-                }
-            }
-        }
-        cleanedTargets = augmented;
     }
 
     if ([self selectMatchingPersonInCapturedDataSourceWithTargets:cleanedTargets candidateTableViews:candidateTableViews]) {
@@ -854,15 +863,7 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
 }
 
 - (BOOL)selectMatchingPersonInTableViews:(NSArray *)tableViews targets:(NSArray<NSString *> *)targets {
-    NSMutableArray *orderedTableViews = [[NSMutableArray alloc] init];
-    if (self.peopleTableView != nil) {
-        [orderedTableViews addObject:self.peopleTableView];
-    }
-    for (id tv in tableViews) {
-        if (![orderedTableViews containsObject:tv]) {
-            [orderedTableViews addObject:tv];
-        }
-    }
+    NSArray *orderedTableViews = self.peopleTableView != nil ? @[self.peopleTableView] : tableViews;
 
     for (id tableView in orderedTableViews) {
         if (![tableView respondsToSelector:@selector(numberOfSections)] ||

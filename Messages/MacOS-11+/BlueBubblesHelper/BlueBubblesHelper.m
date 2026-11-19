@@ -103,22 +103,34 @@
 
 @implementation BlueBubblesHelper
 
-// Chat guids whose outgoing read receipts are dropped for a short window while
+// Chat guids whose outgoing read receipts are dropped until their expiry date while
 // the server marks them read (suppressReceipt option on "mark-chat-read").
-static NSMutableSet<NSString *> *_suppressedReceiptChats = nil;
+static NSMutableDictionary<NSString *, NSDate *> *_suppressedReceiptChats = nil;
 
 +(void) suppressReceiptsForChat:(NSString *)chatGuid {
     if (chatGuid == nil) return;
-    if (_suppressedReceiptChats == nil) _suppressedReceiptChats = [NSMutableSet set];
-    [_suppressedReceiptChats addObject:chatGuid];
+    NSDate *expiry = [NSDate dateWithTimeIntervalSinceNow:15.0];
+    @synchronized(self) {
+        if (_suppressedReceiptChats == nil) _suppressedReceiptChats = [NSMutableDictionary dictionary];
+        NSDate *existing = _suppressedReceiptChats[chatGuid];
+        if (existing == nil || [existing compare:expiry] == NSOrderedAscending) {
+            _suppressedReceiptChats[chatGuid] = expiry;
+        }
+    }
     NSLog(@"BlueBubblesHelper: Suppressing read receipts for chat %@ (15s window)", chatGuid);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [_suppressedReceiptChats removeObject:chatGuid];
-    });
 }
 
 +(BOOL) shouldSuppressReceiptForChat:(NSString *)chatGuid {
-    return chatGuid != nil && [_suppressedReceiptChats containsObject:chatGuid];
+    if (chatGuid == nil) return NO;
+    @synchronized(self) {
+        NSDate *expiry = _suppressedReceiptChats[chatGuid];
+        if (expiry == nil) return NO;
+        if ([expiry timeIntervalSinceNow] > 0) {
+            return YES;
+        }
+        [_suppressedReceiptChats removeObjectForKey:chatGuid];
+        return NO;
+    }
 }
 
 static os_log_t logger;
@@ -522,15 +534,30 @@ static void SendTransactionResponse(NSString *transaction, NSDictionary *extra) 
         SendTransactionResponse(transaction, @{@"pinnedChatGuids": [self getPinnedChatGuids]});
     // If the server tells us to create a chat
     } else if ([event isEqualToString:@"create-chat"]) {
-        NSMutableArray<IMHandle*> *handles = [[NSMutableArray alloc] initWithArray:(@[])];
-        BOOL failed = false;
-        for (NSString* str in data[@"addresses"]) {
-            IMHandle *handle;
-            if ([data[@"service"] isEqualToString:@"iMessage"]) {
-                handle = [[[IMAccountController sharedInstance] activeIMessageAccount] imHandleWithID:(str)];
-            } else {
-                handle = [[[IMAccountController sharedInstance] activeSMSAccount] imHandleWithID:(str)];
+        NSString *requestedService = [data[@"service"] isKindOfClass:[NSString class]] ? data[@"service"] : @"";
+        IMAccount *account = nil;
+        if ([requestedService isEqualToString:@"iMessage"]) {
+            account = [[IMAccountController sharedInstance] activeIMessageAccount];
+        } else if ([requestedService isEqualToString:@"RCS"]) {
+            Class serviceCls = NSClassFromString(@"IMService");
+            if (serviceCls != nil && [serviceCls respondsToSelector:@selector(rcsService)]) {
+                id rcsService = ((id (*)(id, SEL))objc_msgSend)(serviceCls, @selector(rcsService));
+                if (rcsService != nil) {
+                    account = [[IMAccountController sharedInstance] bestAccountForService:rcsService];
+                }
             }
+            if (account == nil) {
+                account = [[IMAccountController sharedInstance] activeSMSAccount];
+            }
+        } else {
+            account = [[IMAccountController sharedInstance] activeSMSAccount];
+        }
+
+        NSMutableArray<IMHandle*> *handles = [[NSMutableArray alloc] initWithArray:(@[])];
+        BOOL failed = (account == nil);
+        for (NSString* str in data[@"addresses"]) {
+            if (failed) break;
+            IMHandle *handle = [account imHandleWithID:(str)];
 
             if (handle != nil) {
                 [handles addObject:handle];
@@ -550,6 +577,10 @@ static void SendTransactionResponse(NSString *transaction, NSDictionary *extra) 
             chat = [[IMChatRegistry sharedInstance] chatForIMHandles:(handles)];
         } else {
             chat = [[IMChatRegistry sharedInstance] chatForIMHandle:(handles[0])];
+        }
+        // Let Messages negotiate RCS vs SMS for unified telephony chats before sending.
+        if (![requestedService isEqualToString:@"iMessage"] && [chat respondsToSelector:@selector(refreshServiceForSending)]) {
+            ((void (*)(id, SEL))objc_msgSend)(chat, @selector(refreshServiceForSending));
         }
         NSMutableDictionary *mutableData = [[NSMutableDictionary alloc] initWithDictionary:data];
         [mutableData setValue:[chat guid] forKey:@"chatGuid"];
@@ -1083,6 +1114,8 @@ static void SendTransactionResponse(NSString *transaction, NSDictionary *extra) 
     if([@"-laugh" isEqualToString:(lowerCaseType)]) return @"Removed a laugh from ";
     if([@"-emphasize" isEqualToString:(lowerCaseType)]) return @"Removed an exclamation from ";
     if([@"-question" isEqualToString:(lowerCaseType)]) return @"Removed a question mark from ";
+    if([@"emoji" isEqualToString:(lowerCaseType)]) return @"Reacted to ";
+    if([@"-emoji" isEqualToString:(lowerCaseType)]) return @"Removed a reaction from ";
     return @"";
 }
 
@@ -1553,6 +1586,13 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
 
     if (data[@"selectedMessageGuid"] != [NSNull null] && [data[@"selectedMessageGuid"] length] != 0) {
         [BlueBubblesHelper getMessageItem:(chat) :(data[@"selectedMessageGuid"]) completionBlock:^(IMMessage *message) {
+            if (message == nil) {
+                DLog("BLUEBUBBLESHELPER: Failed to load selectedMessageGuid %{public}@", data[@"selectedMessageGuid"]);
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"error": @"Failed to find target message!"}];
+                }
+                return;
+            }
             NSInteger partIndex = (data[@"partIndex"] != nil && data[@"partIndex"] != [NSNull null]) ? [data[@"partIndex"] integerValue] : 0;
             IMMessageItem *messageItem = (IMMessageItem *)message._imMessageItem;
             NSObject *items = messageItem._newChatItems;
@@ -1626,32 +1666,48 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
                         id senderObj = nil;
                         if (item != nil && [tapbackSenderCls instancesRespondToSelector:@selector(initWithTapback:chat:messagePartChatItem:)]) {
                             senderObj = ((id (*)(id, SEL, id, id, id))objc_msgSend)([tapbackSenderCls alloc], @selector(initWithTapback:chat:messagePartChatItem:), tapback, chat, item);
-                        } else if ([tapbackSenderCls instancesRespondToSelector:@selector(initWithTapback:chat:messageGUID:messagePartRange:messageSummaryInfo:threadIdentifier:)]) {
-                            NSString *fbText = [message text].string ?: @"";
-                            NSRange fbRange = NSMakeRange(0, fbText.length);
-                            NSDictionary *fbSummary = @{@"amc": @1, @"ams": fbText};
+                        }
+                        // Fall back to explicit GUID/summary initializer when messagePartChatItem returns nil (e.g. attachments or non-text parts).
+                        if (senderObj == nil && [tapbackSenderCls instancesRespondToSelector:@selector(initWithTapback:chat:messageGUID:messagePartRange:messageSummaryInfo:threadIdentifier:)]) {
+                            NSString *fbText = (item != nil && [item text] != nil) ? [item text].string : ([message text].string ?: @"");
+                            NSRange fbRange = (item != nil) ? [item messagePartRange] : NSMakeRange(0, fbText.length);
+                            BOOL isAttachmentPart = (fbText.length == 0 || [fbText isEqualToString:@"\uFFFC"]);
+                            NSDictionary *fbSummary = isAttachmentPart ? @{@"amc": @3} : @{@"amc": @1, @"ams": fbText};
+                            NSString *fbGuid = [NSString stringWithFormat:@"p:%ld/%@", (long)partIndex, [message guid]];
                             senderObj = ((id (*)(id, SEL, id, id, NSString *, NSRange, NSDictionary *, NSString *))objc_msgSend)(
                                 [tapbackSenderCls alloc],
                                 @selector(initWithTapback:chat:messageGUID:messagePartRange:messageSummaryInfo:threadIdentifier:),
                                 tapback,
                                 chat,
-                                [message guid],
+                                fbGuid,
                                 fbRange,
                                 fbSummary,
                                 message.threadIdentifier
                             );
                         }
                         if (senderObj != nil && [senderObj respondsToSelector:@selector(send)]) {
+                            NSString *prevLastGuid = [[chat lastSentMessage] guid];
                             id rawSentGuid = ((id (*)(id, SEL))objc_msgSend)(senderObj, @selector(send));
-                            sentViaNativeTapback = YES;
-                            if (transaction != nil) {
-                                NSString *sentGuid = [rawSentGuid isKindOfClass:[NSString class]] ? (NSString *)rawSentGuid : nil;
-                                if (sentGuid.length == 0) {
-                                    sentGuid = [[chat lastSentMessage] guid];
+                            NSString *sentGuid = [rawSentGuid isKindOfClass:[NSString class]] ? (NSString *)rawSentGuid : nil;
+                            if (sentGuid.length == 0) {
+                                NSString *afterLastGuid = [[chat lastSentMessage] guid];
+                                if (afterLastGuid.length > 0 && ![afterLastGuid isEqualToString:prevLastGuid]) {
+                                    sentGuid = afterLastGuid;
                                 }
-                                [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"identifier": (sentGuid ?: @"")}];
                             }
+                            if (sentGuid.length > 0) {
+                                sentViaNativeTapback = YES;
+                                if (transaction != nil) {
+                                    [[NetworkController sharedInstance] sendMessage:@{@"transactionId": transaction, @"identifier": sentGuid}];
+                                }
+                            } else {
+                                DLog("BLUEBUBBLESHELPER: IMTapbackSender -send returned empty guid for reaction %{public}@ on %{public}@", reaction, [message guid]);
+                            }
+                        } else {
+                            DLog("BLUEBUBBLESHELPER: IMTapbackSender init returned nil for reaction %{public}@ on %{public}@", reaction, [message guid]);
                         }
+                    } else {
+                        DLog("BLUEBUBBLESHELPER: Failed to construct native tapback for reaction %{public}@ (emoji=%{public}@)", reaction, emojiStr ?: @"");
                     }
                 }
 
@@ -1702,6 +1758,15 @@ static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
                     // IMTypingChatItem) throws "unrecognized selector" and aborts Messages.
                     // If we don't have a real message-part item, just send without threading.
                     identifier = IMCreateThreadIdentifierForMessagePartChatItem(item);
+                }
+                if (identifier.length == 0 && [message guid].length > 0) {
+                    NSString *fallbackText = [message text].string ?: @"";
+                    NSRange fallbackRange = NSMakeRange(0, fallbackText.length);
+                    if (IMCreateThreadIdentifier != NULL) {
+                        identifier = IMCreateThreadIdentifier([message guid], partIndex, fallbackRange);
+                    } else {
+                        identifier = [NSString stringWithFormat:@"r:%ld:0:%lu:%@", (long)partIndex, (unsigned long)fallbackRange.length, [message guid]];
+                    }
                 }
                 if (identifier.length == 0) identifier = nil;
                 IMMessage *rootOriginator = nil;

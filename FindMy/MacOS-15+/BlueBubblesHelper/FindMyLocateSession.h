@@ -30,7 +30,6 @@ typedef void (^FindMyLocationUpdateCallback)(id _Nullable location, id handle);
                                  priority:(long long)priority
                               isFromGroup:(BOOL)isFromGroup
                                completion:(FindMyCompletion)completion;
-- (void)stopRefreshingLocationWithCompletion:(FindMyCompletion)completion;
 - (void)startUpdatingFriendsWithInitialUpdates:(BOOL)includeInitialUpdates
                                     completion:(FindMyCompletion)completion;
 

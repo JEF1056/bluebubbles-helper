@@ -509,6 +509,20 @@ static void BBTestPeopleFocusAndHelperIntegration(
     BBAssert([BBRecordedStarts.firstObject[@"priority"] isEqual:@2],
              @"start-findmy-live-location must still use live priority 2");
 
+    // 9d. Polling Alice while Alice is already live must use priority 1 and not stop priority 2.
+    [BBRecordedStarts removeAllObjects];
+    [BBRecordedStops removeAllObjects];
+    [socket.sentMessages removeAllObjects];
+    [helper handleServerAction:@"refresh-findmy-friends"
+                          data:@{@"handle": @"alice@example.com"}
+         transactionIdentifier:@"tx-poll-while-live"];
+    BBAssert(BBWaitUntil(^BOOL { return socket.sentMessages.count >= 1; }, 0.5),
+             @"poll while live must complete");
+    BBAssert([BBRecordedStarts.firstObject[@"priority"] isEqual:@1],
+             @"polling an already-live handle must use priority 1 instead of leaking priority 2");
+    BBAssert(BBRecordedStops.count == 0,
+             @"polling an already-live handle must not stop the active priority-2 live stream");
+
     // Verify streaming callback still works after UI focus.
     [socket.sentMessages removeAllObjects];
     BBMockLiveLocation *liveUpdate = [[BBMockLiveLocation alloc] init];
@@ -676,6 +690,15 @@ int main(void) {
         BBAssert(startBobRaceReply != nil && [startBobRaceReply[@"live"] isEqual:@YES],
                  @"start(bob) must complete with live: true instead of superseded");
         BBAssert(startBobRaceReply[@"superseded"] == nil, @"start(bob) must not be superseded");
+
+        // Cleanly stop Bob before UI focus / refresh integration tests.
+        [BBRecordedStops removeAllObjects];
+        [socket.sentMessages removeAllObjects];
+        [helper handleServerAction:@"stop-findmy-live-location"
+                              data:@{@"handle": @"bob@example.com"}
+             transactionIdentifier:@"tx-race-cleanup-bob"];
+        BBAssert(BBWaitUntil(^BOOL { return BBRecordedStops.count == 1 && socket.sentMessages.count == 1; }, 0.5),
+                 @"cleanup stop for bob must complete");
 
         BBTestPeopleFocusAndHelperIntegration(helper, socket);
 
