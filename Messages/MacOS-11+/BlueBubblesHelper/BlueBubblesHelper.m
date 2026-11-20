@@ -262,25 +262,35 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     }
 }
 
-- (void)handleReadStatusForChat:(NSString *)chatGuid isRead:(BOOL)isRead transaction:(NSString *)transaction {
+- (void)handleReadStatusForChat:(NSString *)chatGuid isRead:(BOOL)isRead suppressReceipt:(BOOL)suppressReceipt transaction:(NSString *)transaction {
     IMChat *chat = [self getIMChatFromGuid:chatGuid transaction:transaction];
     
     if (chat != nil) {
         if (isRead) {
-            [chat markAllMessagesAsRead];
-
-            // The read state flushes to the daemon on a timer that only fires
-            // while Messages is active; on a headless server it never fires and
-            // the read never persists (or syncs). Flush it immediately.
+            NSString *canonicalGuid = chat.guid ?: chatGuid;
+            if (!suppressReceipt) {
+                [BlueBubblesHelper beginAllowingReceiptsForChat:canonicalGuid];
+            }
             @try {
-                IMChatRegistry *registry = [NSClassFromString(@"IMChatRegistry") sharedInstance];
-                NSTimer *flushTimer = [registry valueForKey:@"markAsReadTimer"];
-                if (flushTimer != nil) [flushTimer fire];
-                if ([chat respondsToSelector:NSSelectorFromString(@"__clearReadMessageCache")]) {
-                    [chat performSelector:NSSelectorFromString(@"__clearReadMessageCache")];
+                [chat markAllMessagesAsRead];
+
+                // The read state flushes to the daemon on a timer that only fires
+                // while Messages is active; on a headless server it never fires and
+                // the read never persists (or syncs). Flush it immediately.
+                @try {
+                    IMChatRegistry *registry = [NSClassFromString(@"IMChatRegistry") sharedInstance];
+                    NSTimer *flushTimer = [registry valueForKey:@"markAsReadTimer"];
+                    if (flushTimer != nil) [flushTimer fire];
+                    if ([chat respondsToSelector:NSSelectorFromString(@"__clearReadMessageCache")]) {
+                        [chat performSelector:NSSelectorFromString(@"__clearReadMessageCache")];
+                    }
+                } @catch (NSException *e) {
+                    os_log(logger, "Failed to flush read state for %{public}@: %{public}@", chatGuid, e);
                 }
-            } @catch (NSException *e) {
-                os_log(logger, "Failed to flush read state for %{public}@: %{public}@", chatGuid, e);
+            } @finally {
+                if (!suppressReceipt) {
+                    [BlueBubblesHelper endAllowingReceiptsForChat:canonicalGuid];
+                }
             }
         } else {
             [chat markLastMessageAsUnread];
@@ -366,12 +376,10 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     } else if ([event isEqualToString:@"check-typing-status"]) {
         [self checkTypingIndicatorForChat:chatGuid transaction:transaction];
     } else if ([event isEqualToString:@"mark-chat-read"]) {
-        if ([data[@"suppressReceipt"] boolValue]) {
-            [BlueBubblesHelper suppressReceiptsForChat:chatGuid];
-        }
-        [self handleReadStatusForChat:chatGuid isRead:YES transaction:transaction];
+        BOOL suppressReceipt = [data[@"suppressReceipt"] boolValue];
+        [self handleReadStatusForChat:chatGuid isRead:YES suppressReceipt:suppressReceipt transaction:transaction];
     } else if ([event isEqualToString:@"mark-chat-unread"]) {
-        [self handleReadStatusForChat:chatGuid isRead:NO transaction:transaction];
+        [self handleReadStatusForChat:chatGuid isRead:NO suppressReceipt:YES transaction:transaction];
     } else if ([event isEqualToString:@"set-display-name"]) {
         [self setDisplayNameForChat:chatGuid withData:data transaction:transaction];
     } else if ([event isEqualToString:@"add-participant"]) {

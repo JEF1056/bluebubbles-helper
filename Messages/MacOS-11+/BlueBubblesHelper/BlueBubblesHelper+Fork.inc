@@ -6,9 +6,10 @@
 - (id)initWithData:(NSData *)data MIMEType:(NSString *)mime;
 @end
 
-// Chat guids whose outgoing read receipts are dropped until their expiry date while
-// the server marks them read (suppressReceipt option on "mark-chat-read").
-static NSMutableDictionary<NSString *, NSDate *> *_suppressedReceiptChats = nil;
+// Chat guids actively allowed to send outgoing read receipts during an explicit
+// "mark-chat-read" without suppressReceipt. Default-deny blocks all other receipts
+// (e.g., Catalyst scene restore / window activation / relaunch).
+static NSMutableDictionary<NSString *, NSNumber *> *_allowedReceiptChatCounts = nil;
 
 // Largest image the helper reads for a link preview (the server caps images at the same size)
 static const unsigned long long kRichLinkMaxImageBytes = 5 * 1024 * 1024;
@@ -21,29 +22,31 @@ static void RichLinkStep(NSString *step, id result) {
 
 @implementation BlueBubblesHelper (Fork)
 
-+ (void)suppressReceiptsForChat:(NSString *)chatGuid {
++ (void)beginAllowingReceiptsForChat:(NSString *)chatGuid {
     if (chatGuid == nil) return;
-    NSDate *expiry = [NSDate dateWithTimeIntervalSinceNow:15.0];
     @synchronized(self) {
-        if (_suppressedReceiptChats == nil) _suppressedReceiptChats = [NSMutableDictionary dictionary];
-        NSDate *existing = _suppressedReceiptChats[chatGuid];
-        if (existing == nil || [existing compare:expiry] == NSOrderedAscending) {
-            _suppressedReceiptChats[chatGuid] = expiry;
-        }
+        if (_allowedReceiptChatCounts == nil) _allowedReceiptChatCounts = [NSMutableDictionary dictionary];
+        NSInteger count = [_allowedReceiptChatCounts[chatGuid] integerValue];
+        _allowedReceiptChatCounts[chatGuid] = @(count + 1);
     }
-    NSLog(@"BlueBubblesHelper: Suppressing read receipts for chat %@ (15s window)", chatGuid);
 }
 
-+ (BOOL)shouldSuppressReceiptForChat:(NSString *)chatGuid {
++ (void)endAllowingReceiptsForChat:(NSString *)chatGuid {
+    if (chatGuid == nil) return;
+    @synchronized(self) {
+        NSInteger count = [_allowedReceiptChatCounts[chatGuid] integerValue];
+        if (count <= 1) {
+            [_allowedReceiptChatCounts removeObjectForKey:chatGuid];
+        } else {
+            _allowedReceiptChatCounts[chatGuid] = @(count - 1);
+        }
+    }
+}
+
++ (BOOL)shouldAllowReceiptForChat:(NSString *)chatGuid {
     if (chatGuid == nil) return NO;
     @synchronized(self) {
-        NSDate *expiry = _suppressedReceiptChats[chatGuid];
-        if (expiry == nil) return NO;
-        if ([expiry timeIntervalSinceNow] > 0) {
-            return YES;
-        }
-        [_suppressedReceiptChats removeObjectForKey:chatGuid];
-        return NO;
+        return [_allowedReceiptChatCounts[chatGuid] integerValue] > 0;
     }
 }
 
@@ -561,7 +564,7 @@ static id BBPerformIfResponds(id obj, const char *selName) {
 
 static BOOL BBShouldSuppressChatReceipt(id chat) {
     NSString *guid = BBPerformIfResponds(chat, "guid");
-    BOOL suppress = [BlueBubblesHelper shouldSuppressReceiptForChat:guid];
+    BOOL suppress = ![BlueBubblesHelper shouldAllowReceiptForChat:guid];
     NSLog(@"BlueBubblesHelper: %@ read receipt for chat %@", suppress ? @"Suppressed" : @"Sending", guid);
     return suppress;
 }
@@ -592,10 +595,10 @@ ZKSwizzleInterface(BBH_CKConversationListStandardCell, CKConversationListStandar
 
 @end
 
-// Drops outgoing read receipts for chats in the suppression set. markAllMessagesAsRead
-// triggers the receipt send inside IMCore; no-op'ing it here keeps the local read
-// state (and own-device sync) without notifying the sender. Suppression is requested
-// per chat by the server via "mark-chat-read" with suppressReceipt=true.
+// Default-deny outgoing read receipts. IMCore triggers receipt sends synchronously from
+// markAllMessagesAsRead / markMessagesAsRead:; no-op'ing here keeps local read state
+// unless BlueBubblesHelper explicitly allows the chat for an active "mark-chat-read"
+// request without suppressReceipt.
 ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
 @implementation BBH_IMChatRegistry_Receipts
 

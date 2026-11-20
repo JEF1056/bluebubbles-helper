@@ -19,10 +19,13 @@
 // Methods
 -(void) handleServerEvent: (NSString*)event data: (NSDictionary*)data transactionId: (NSString*)transaction;
 
-// Read-receipt suppression used by "mark-chat-read" (suppressReceipt option)
-+(void) suppressReceiptsForChat:(NSString *)chatGuid;
-+(BOOL) shouldSuppressReceiptForChat:(NSString *)chatGuid;
+@end
 
+// Default-deny read-receipt gate: blocked unless explicitly allowed during a "mark-chat-read" without suppressReceipt.
+@interface BlueBubblesHelper (ReceiptGate)
++(void) beginAllowingReceiptsForChat:(NSString *)chatGuid;
++(void) endAllowingReceiptsForChat:(NSString *)chatGuid;
++(BOOL) shouldAllowReceiptForChat:(NSString *)chatGuid;
 @end
 
 #endif /* BlueBubblesHelper_h */
