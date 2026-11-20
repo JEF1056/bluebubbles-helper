@@ -163,6 +163,9 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
 
 // Run when receiving a new message from the tcp socket
 -(void) handleMessage: (NetworkController*)controller  message:(NSString *)message {
+    if (![message isKindOfClass:[NSString class]] || message.length == 0) {
+        return;
+    }
     // The data is in the form of a json string, so we need to convert it to a NSDictionary
     // for some reason the data is sometimes duplicated, so account for that
     NSRange range = [message rangeOfString:@"}\n{"];
@@ -170,19 +173,26 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         message = [message substringWithRange:NSMakeRange(0, range.location + 1)];
     }
     DLog("BLUEBUBBLESFACETIMEHELPER: Received raw json: %{public}@", message);
-    NSError *error;
+    NSError *error = nil;
     NSData *jsonData = [message dataUsingEncoding:NSUTF8StringEncoding];
-    NSDictionary *dictionary = [NSJSONSerialization JSONObjectWithData:jsonData options:kNilOptions error:&error];
+    if (jsonData == nil || jsonData.length == 0) {
+        return;
+    }
+    id parsed = [NSJSONSerialization JSONObjectWithData:jsonData options:kNilOptions error:&error];
+    if (error != nil || ![parsed isKindOfClass:[NSDictionary class]]) {
+        return;
+    }
+    NSDictionary *dictionary = (NSDictionary *)parsed;
 
     // Event is the type of packet that was sent
-    NSString *event = dictionary[@"action"];
-    // Data is the actual information that we need in the packet
-    NSDictionary *data = dictionary[@"data"];
-    // Transaction ID enables us to communicate back to the server that the action was complete
-    NSString *transaction = nil;
-    if ([dictionary objectForKey:(@"transactionId")] != [NSNull null]) {
-        transaction = dictionary[@"transactionId"];
+    NSString *event = [dictionary[@"action"] isKindOfClass:[NSString class]] ? dictionary[@"action"] : nil;
+    if (event.length == 0) {
+        return;
     }
+    // Data is the actual information that we need in the packet
+    NSDictionary *data = [dictionary[@"data"] isKindOfClass:[NSDictionary class]] ? dictionary[@"data"] : @{};
+    // Transaction ID enables us to communicate back to the server that the action was complete
+    NSString *transaction = [dictionary[@"transactionId"] isKindOfClass:[NSString class]] ? dictionary[@"transactionId"] : nil;
 
     DLog("BLUEBUBBLESFACETIMEHELPER: Message received: %{public}@, %{public}@", event, data);
     NetworkController *replyController = controller ?: [NetworkController sharedInstance];
@@ -190,7 +200,8 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
     if ([self handleForkMessage:replyController event:event data:data transaction:transaction]) return;
 
     if ([event isEqualToString:@"answer-call"]) {
-        TUCall *call = [[TUCallCenter sharedInstance] callWithCallUUID:(data[@"callUUID"])];
+        NSString *callUUID = [data[@"callUUID"] isKindOfClass:[NSString class]] ? data[@"callUUID"] : nil;
+        TUCall *call = callUUID != nil ? [[TUCallCenter sharedInstance] callWithCallUUID:callUUID] : nil;
         
         if ([call callStatus] != 4) {
             if (transaction != nil) {

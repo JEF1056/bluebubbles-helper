@@ -13,6 +13,13 @@
 #import "Logging.h"
 #import "BlueBubblesHelper.h"
 
+static const NSUInteger kBBMaxSocketMessageBytes = 64 * 1024 * 1024;
+
+@interface NetworkController () {
+    NSMutableData *_readBuffer;
+}
+@end
+
 @implementation NetworkController
 
 
@@ -44,27 +51,40 @@ static os_log_t logger;
     // then we add this to the base port to get a unique port for the socket
     int port = CLAMP(45670 + getuid()-501, 45670, 65535);
     os_log(logger, "Connecting to socket on port %d...", port);
-    
+
+    if (asyncSocket != nil) {
+        asyncSocket.delegate = nil;
+        [asyncSocket disconnect];
+    }
+    _readBuffer = [[NSMutableData alloc] init];
+
     // connect to socket
     asyncSocket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_main_queue()];
-    
+
     NSError *err = nil;
     if (![asyncSocket connectToHost:@"localhost" onPort:port error:&err]) {
         // If there was an error, it's likely something like "already connected" or "no delegate set"
         os_log_error(logger, "Failed to connect to socket! %@", err);
+        return;
     }
-    
-    // initiate the 1st read request in anticipation
-    [asyncSocket readDataWithTimeout:(-1) tag:(1)];
+
+    // Read LF-delimited JSON frames up to 64MB so multi-byte UTF-8 sequences cannot split across chunks.
+    [asyncSocket readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
 }
 
 - (void)sendMessage:(NSDictionary*)data {
-    NSError *error;
+    if (![data isKindOfClass:[NSDictionary class]] || ![NSJSONSerialization isValidJSONObject:data]) {
+        return;
+    }
+    NSError *error = nil;
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:data options:0 error:&error];
-    if (error) {
+    if (error != nil || jsonData == nil) {
         os_log_error(logger, "Failed to serialize data! %@", error);
     } else {
         NSString *message = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+        if (message == nil) {
+            return;
+        }
         // add a newline to the message so back-to-back messages are split and sent correctly
         NSString *jsonMessage = [NSString stringWithFormat:(@"%@\r\n"), message];
         NSData* finalData = [jsonMessage dataUsingEncoding:NSUTF8StringEncoding];
@@ -77,17 +97,26 @@ static os_log_t logger;
 #pragma mark - Private methods
 // The data from the server is in the form of a json string, so we need to convert it to a NSDictionary
 - (NSDictionary*) jsonDecode:(NSString*) json {
+    if (![json isKindOfClass:[NSString class]] || json.length == 0) {
+        return nil;
+    }
     // For some reason the data is sometimes duplicated, so account for that
     NSRange range = [json rangeOfString:@"}\n{"];
     if (range.location != NSNotFound) {
         json = [json substringWithRange:NSMakeRange(0, range.location + 1)];
     }
     
-    NSError *error;
+    NSError *error = nil;
     NSData *jsonData = [json dataUsingEncoding:NSUTF8StringEncoding];
-    NSDictionary *dictionary = [NSJSONSerialization JSONObjectWithData:jsonData options:kNilOptions error:&error];
+    if (jsonData == nil || jsonData.length == 0) {
+        return nil;
+    }
+    id dictionary = [NSJSONSerialization JSONObjectWithData:jsonData options:kNilOptions error:&error];
+    if (error != nil || ![dictionary isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
     
-    return dictionary;
+    return (NSDictionary *)dictionary;
 }
 
 
@@ -107,26 +136,60 @@ static os_log_t logger;
 }
 
 - (void)socket:(GCDAsyncSocket*)sock didReadData:(NSData*)data withTag:(long)tag {
-    NSString* str = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-    os_log(logger, "Received data from server:\r\n%{public}@\r\nwith tag: %{public}ld", str, tag);
-    // initiate a new read request for the next data item
-    [asyncSocket readDataWithTimeout:(-1) tag:(1)];
-    
-    // parse and send the data to the handler
-    NSDictionary* dictionary = [self jsonDecode:str];
-    // Event is the type of packet that was sent
-    NSString *event = dictionary[@"action"];
-    // Data is the actual information that we need in the packet
-    NSDictionary *eventData = dictionary[@"data"];
-    // Transaction ID enables us to communicate back to the server that the action was complete
-    NSString *transaction = nil;
-    if ([dictionary objectForKey:(@"transactionId")] != [NSNull null]) {
-        transaction = dictionary[@"transactionId"];
+    [asyncSocket readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
+    if (data.length == 0) {
+        return;
     }
-    [[BlueBubblesHelper sharedInstance] handleServerEvent:event data:eventData transactionId:transaction];
+    if (_readBuffer == nil) {
+        _readBuffer = [[NSMutableData alloc] init];
+    }
+    if (data.length > kBBMaxSocketMessageBytes || _readBuffer.length > kBBMaxSocketMessageBytes - data.length) {
+        os_log_error(logger, "Incoming socket frame exceeded 64MB limit; disconnecting");
+        [_readBuffer setLength:0];
+        [sock disconnect];
+        return;
+    }
+    [_readBuffer appendData:data];
+
+    NSData *lfData = [GCDAsyncSocket LFData];
+    while (YES) {
+        NSRange nlRange = [_readBuffer rangeOfData:lfData options:0 range:NSMakeRange(0, _readBuffer.length)];
+        if (nlRange.location == NSNotFound) {
+            break;
+        }
+        NSData *frameData = [_readBuffer subdataWithRange:NSMakeRange(0, nlRange.location)];
+        [_readBuffer replaceBytesInRange:NSMakeRange(0, nlRange.location + 1) withBytes:NULL length:0];
+
+        if (frameData.length > 0 && ((const uint8_t *)frameData.bytes)[frameData.length - 1] == '\r') {
+            frameData = [frameData subdataWithRange:NSMakeRange(0, frameData.length - 1)];
+        }
+        if (frameData.length == 0) {
+            continue;
+        }
+
+        NSString *str = [[NSString alloc] initWithData:frameData encoding:NSUTF8StringEncoding];
+        if (str == nil || str.length == 0) {
+            os_log_error(logger, "Dropping invalid UTF-8 socket frame (%lu bytes)", (unsigned long)frameData.length);
+            continue;
+        }
+        os_log(logger, "Received data from server:\r\n%{public}@\r\nwith tag: %{public}ld", str, tag);
+
+        NSDictionary *dictionary = [self jsonDecode:str];
+        if (dictionary == nil) {
+            continue;
+        }
+        NSString *event = [dictionary[@"action"] isKindOfClass:[NSString class]] ? dictionary[@"action"] : nil;
+        if (event.length == 0) {
+            continue;
+        }
+        NSDictionary *eventData = [dictionary[@"data"] isKindOfClass:[NSDictionary class]] ? dictionary[@"data"] : @{};
+        NSString *transaction = [dictionary[@"transactionId"] isKindOfClass:[NSString class]] ? dictionary[@"transactionId"] : nil;
+        [[BlueBubblesHelper sharedInstance] handleServerEvent:event data:eventData transactionId:transaction];
+    }
 }
 
 - (void)socketDidDisconnect:(GCDAsyncSocket *)sock withError:(NSError *)err {
+    [_readBuffer setLength:0];
     os_log_error(logger, "Disconnected from server, attempting to reconnect in 5 seconds...\r\n(%{public}@)", err);
     double delayInSeconds = 5.0;
     dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));

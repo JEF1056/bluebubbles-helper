@@ -9,6 +9,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)sharedInstance;
 - (void)installCapture;
+- (void)restoreBackgroundRefreshConditions;
 
 - (void)scheduleFocusPeopleTabAndSelectTargets:(NSArray<NSString *> *)targets;
 - (BOOL)focusPeopleTabAndSelectTargets:(NSArray<NSString *> *)targets

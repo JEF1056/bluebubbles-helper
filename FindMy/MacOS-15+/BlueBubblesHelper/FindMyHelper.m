@@ -37,6 +37,8 @@ static const long long BBLiveLocationRefreshPriority = 2;
 - (nullable FindMyLocateSession *)locateSession;
 - (void)startStreamingLocationsForAllFriends:(FindMyLocateSession *)session
                                focusedHandle:(nullable NSString *)focusedHandle;
+- (void)restoreFocusConditionsIfIdle;
+
 - (void)handleFriendsRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier
                                                 data:(nullable NSDictionary *)data;
 - (void)handleStartLiveLocationForTransactionIdentifier:(nullable NSString *)transactionIdentifier
@@ -424,6 +426,11 @@ static os_log_t helperLog;
         NSUInteger sessionGen = self.liveSessionGeneration;
         NSString *normalizedTarget = trimmedHandle.lowercaseString;
         self.pendingLiveNormalizedIdentifier = normalizedTarget;
+        for (FindMyFriendsRefreshCoordinator *coordinator in self.activeFriendRefreshes) {
+            if ([coordinator.focusedHandle.lowercaseString isEqualToString:normalizedTarget]) {
+                coordinator.preserveFocusedLiveRefresh = YES;
+            }
+        }
 
         if (self.activeLiveHandleObject != nil &&
             self.activeLiveNormalizedIdentifier != nil &&
@@ -444,6 +451,7 @@ static os_log_t helperLog;
                 return;
             }
             if (sessionGen != strongSelf.liveSessionGeneration) {
+                [strongSelf restoreFocusConditionsIfIdle];
                 [strongSelf sendTransactionResponse:transactionIdentifier payload:@{
                     @"live": @NO,
                     @"superseded": @YES,
@@ -456,6 +464,7 @@ static os_log_t helperLog;
                 if ([strongSelf.pendingLiveNormalizedIdentifier isEqualToString:normalizedTarget]) {
                     strongSelf.pendingLiveNormalizedIdentifier = nil;
                 }
+                [strongSelf restoreFocusConditionsIfIdle];
                 [strongSelf sendError:[NSString stringWithFormat:@"Find My friend handle not found: %@", trimmedHandle]
                 transactionIdentifier:transactionIdentifier];
                 return;
@@ -544,6 +553,7 @@ static os_log_t helperLog;
         self.pendingLiveNormalizedIdentifier = nil;
 
         [self stopLiveRefreshForHandleObject:handleToStop normalizedIdentifier:stoppedIdentifier session:session];
+        [self restoreFocusConditionsIfIdle];
 
         [self sendTransactionResponse:transactionIdentifier payload:@{
             @"stopped": @(handleToStop != nil),
@@ -594,6 +604,7 @@ static os_log_t helperLog;
                 if (weakCoordinator != nil) {
                     [strongSelf.activeFriendRefreshes removeObject:weakCoordinator];
                 }
+                [strongSelf restoreFocusConditionsIfIdle];
                 if (!strongSelf.friendStreamingStarted) {
                     strongSelf.friendStreamingStarted = YES;
                     [strongSelf startStreamingLocationsForAllFriends:session focusedHandle:nil];
@@ -637,6 +648,14 @@ static os_log_t helperLog;
     weakCoordinator = coordinator;
     [self.activeDeviceRefreshes addObject:coordinator];
     [coordinator start];
+}
+
+- (void)restoreFocusConditionsIfIdle {
+    if (self.activeLiveHandleObject == nil &&
+        self.pendingLiveNormalizedIdentifier == nil &&
+        self.activeFriendRefreshes.count == 0) {
+        [[FindMyPeopleFocusController sharedInstance] restoreBackgroundRefreshConditions];
+    }
 }
 
 @end

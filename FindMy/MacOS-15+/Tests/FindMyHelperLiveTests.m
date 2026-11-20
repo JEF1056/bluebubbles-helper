@@ -539,6 +539,38 @@ static void BBTestPeopleFocusAndHelperIntegration(
     BBAssert([socket.sentMessages.firstObject[@"event"] isEqualToString:@"new-findmy-location"],
              @"callback must emit new-findmy-location");
 
+    // 9e. Stopping live location when idle restores forced window visibility flags (M1).
+    [BBRecordedStops removeAllObjects];
+    [socket.sentMessages removeAllObjects];
+    [helper handleServerAction:@"stop-findmy-live-location"
+                          data:@{@"handle": @"alice@example.com"}
+         transactionIdentifier:@"tx-stop-restore-m1"];
+    BBAssert(BBWaitUntil(^BOOL { return BBRecordedStops.count == 1 && socket.sentMessages.count == 1; }, 0.5),
+             @"stop after live focus must complete");
+    BBAssert(!conditionProvider->isWindowVisible && !conditionProvider->isFrontmostWindow,
+             @"stopping live session while Find My is inactive must restore forced window visibility flags");
+
+    // 9f. Switching condition providers during a focus retry must reset old provider without cancelling retry.
+    BBMockFMConditionProvider *conditionProvider2 = [[BBMockFMConditionProvider alloc] init];
+    mediator->conditionProvider = conditionProvider;
+    NSArray *savedSections = tableView.sections;
+    tableView.sections = @[];
+    tableDelegate.didSelectCount = 0;
+    tableView.selectedIndexPath = nil;
+    [focusController scheduleFocusPeopleTabAndSelectTargets:@[@"5552345678"]];
+    mediator->conditionProvider = conditionProvider2;
+    [focusController focusPeopleTabAndSelectTargets:@[@"5552345678"] inRootObjects:@[window]];
+    BBAssert(!conditionProvider->isWindowVisible && !conditionProvider->isFrontmostWindow,
+             @"switching conditionProvider must reset previously forced provider flags");
+    BBAssert(conditionProvider2->isWindowVisible && conditionProvider2->isFrontmostWindow,
+             @"new conditionProvider must have visibility flags enabled");
+    tableView.sections = savedSections;
+    BBAssert(BBWaitUntil(^BOOL { return tableDelegate.didSelectCount >= 1; }, 0.6),
+             @"provider switch must not bump focusGeneration and cancel pending focus retry");
+    [focusController restoreBackgroundRefreshConditions];
+    BBAssert(!conditionProvider2->isWindowVisible && !conditionProvider2->isFrontmostWindow,
+             @"restoreBackgroundRefreshConditions must reset active provider flags");
+
     BBMockSharedUIApplicationInstance = nil;
 }
 

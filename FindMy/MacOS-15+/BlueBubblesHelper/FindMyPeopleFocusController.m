@@ -28,6 +28,7 @@ static NSInteger const BBUITableViewScrollPositionMiddle = 2;
 + (nullable id)sharedApplication;
 + (nullable NSIndexPath *)indexPathForRow:(NSInteger)row inSection:(NSInteger)section;
 
+- (NSInteger)applicationState;
 - (nullable NSSet *)connectedScenes;
 - (nullable NSArray *)windows;
 - (nullable id)keyWindow;
@@ -71,6 +72,9 @@ static NSInteger const BBUITableViewScrollPositionMiddle = 2;
 @property (nonatomic, weak, nullable, readwrite) id peopleDataSource;
 @property (nonatomic, weak, nullable, readwrite) id peopleTableView;
 @property (nonatomic, assign) NSUInteger focusGeneration;
+@property (nonatomic, weak, nullable) id forcedConditionProvider;
+@property (nonatomic, assign) BOOL forcedWindowVisible;
+@property (nonatomic, assign) BOOL forcedFrontmostWindow;
 
 - (void)recordPeopleDataSource:(id)dataSource tableView:(nullable id)tableView;
 
@@ -723,8 +727,50 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
     if (conditionProvider == nil) {
         return;
     }
-    BBSetBoolIvarIfFalse(conditionProvider, "isWindowVisible");
-    BBSetBoolIvarIfFalse(conditionProvider, "isFrontmostWindow");
+    if (self.forcedConditionProvider != nil && self.forcedConditionProvider != conditionProvider) {
+        // Switching providers during a retry must reset the old provider without bumping focusGeneration.
+        [self resetForcedBackgroundRefreshFlags];
+    }
+    if (BBSetBoolIvarIfFalse(conditionProvider, "isWindowVisible")) {
+        self.forcedWindowVisible = YES;
+    }
+    if (BBSetBoolIvarIfFalse(conditionProvider, "isFrontmostWindow")) {
+        self.forcedFrontmostWindow = YES;
+    }
+    self.forcedConditionProvider = conditionProvider;
+}
+
+- (void)resetForcedBackgroundRefreshFlags {
+    id provider = self.forcedConditionProvider;
+    BOOL visible = self.forcedWindowVisible;
+    BOOL frontmost = self.forcedFrontmostWindow;
+    self.forcedWindowVisible = NO;
+    self.forcedFrontmostWindow = NO;
+    self.forcedConditionProvider = nil;
+    if (provider == nil || (!visible && !frontmost)) {
+        return;
+    }
+    // Leave flags alone when Find My is genuinely foreground-active (UIApplicationStateActive == 0).
+    Class uiAppClass = NSClassFromString(@"UIApplication");
+    id<BBFindMyUIKitProxy> uiApp = (uiAppClass != Nil && [(id)uiAppClass respondsToSelector:@selector(sharedApplication)])
+        ? [(id<BBFindMyUIKitProxy>)uiAppClass sharedApplication]
+        : nil;
+    if (uiApp != nil && [uiApp respondsToSelector:@selector(applicationState)] && [uiApp applicationState] == 0) {
+        return;
+    }
+    BOOL *visiblePtr = visible ? BBBoolIvarPtr(provider, "isWindowVisible") : NULL;
+    BOOL *frontmostPtr = frontmost ? BBBoolIvarPtr(provider, "isFrontmostWindow") : NULL;
+    if (visiblePtr != NULL) {
+        *visiblePtr = NO;
+    }
+    if (frontmostPtr != NULL) {
+        *frontmostPtr = NO;
+    }
+}
+
+- (void)restoreBackgroundRefreshConditions {
+    self.focusGeneration += 1;
+    [self resetForcedBackgroundRefreshFlags];
 }
 
 - (BOOL)selectMatchingPersonInCapturedDataSourceWithTargets:(NSArray<NSString *> *)targets

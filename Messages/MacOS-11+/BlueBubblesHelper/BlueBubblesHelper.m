@@ -178,7 +178,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                 NSArray<NSString *> *pinnedChatGuids = [[BlueBubblesHelper sharedInstance] getPinnedChatGuids];
                 [[NetworkController sharedInstance] sendMessage:@{
                     @"event": @"pinned-chats-updated",
-                    @"pinnedChatGuids": pinnedChatGuids
+                    @"pinnedChatGuids": pinnedChatGuids ?: @[]
                 }];
             }];
             
@@ -258,7 +258,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     if (chat != nil) {
         NSString *event = chat.lastIncomingMessage.isTypingMessage == YES ? @"started-typing" : @"stopped-typing";
         
-        [networkController sendMessage: @{@"event": event, @"guid": chat.guid}];
+        [networkController sendMessage: @{@"event": event, @"guid": chat.guid ?: [NSNull null]}];
     }
 }
 
@@ -298,7 +298,9 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     NSString *newName = data[@"newName"];
     
     if (newName == nil) {
-        [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Provide a new name for the chat! (newName parameter missing)"}];
+        if (transaction != nil) {
+            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Provide a new name for the chat! (newName parameter missing)"}];
+        }
         return;
     }
     
@@ -316,14 +318,18 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     NSString *address = data[@"address"];
     
     if (address == nil) {
-        [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Provide an address to update!"}];
+        if (transaction != nil) {
+            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Provide an address to update!"}];
+        }
         return;
     }
     
     CKConversation *chat = [self getCKConversationFromGuid:chatGuid transaction:transaction];
     if (chat != nil) {
         if (isAdding && !chat.canInsertMoreRecipients) {
-            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Unable to add more recipients!"}];
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Unable to add more recipients!"}];
+            }
             return;
         }
         
@@ -339,7 +345,9 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
             os_log(logger, "%@ participant '%@' to chat %{public}@", isAdding ? @"Added" : @"Removed", chatGuid, address);
             SendTransactionResponse(transaction, nil);
         } else {
-            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Failed to find handle!"}];
+            if (transaction != nil) {
+                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Failed to find handle!"}];
+            }
             os_log(logger, "Failed to find handle '%@' (%@ participant)", address, isAdding ? @"add" : @"remove");
         }
     }
@@ -387,53 +395,75 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
         [BlueBubblesHelper getMessageItem:(chat) :(data[@"messageGuid"]) completionBlock:^(IMMessage *message) {
             if (message == nil) {
                 DLog("BLUEBUBBLESHELPER: Edit failed - message is nil");
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, @{@"error": @"Message not found"});
+                }
                 return;
             }
 
-            NSMutableAttributedString *editedString = [[NSMutableAttributedString alloc] initWithString: data[@"editedMessage"]];
-            NSMutableAttributedString *bcString = [[NSMutableAttributedString alloc] initWithString: data[@"backwardsCompatibilityMessage"]];
+            NSString *editedText = [data[@"editedMessage"] isKindOfClass:[NSString class]] ? data[@"editedMessage"] : @"";
+            NSString *bcText = [data[@"backwardsCompatibilityMessage"] isKindOfClass:[NSString class]] ? data[@"backwardsCompatibilityMessage"] : @"";
+            NSMutableAttributedString *editedString = [[NSMutableAttributedString alloc] initWithString:editedText];
+            NSMutableAttributedString *bcString = [[NSMutableAttributedString alloc] initWithString:bcText];
             NSInteger partIndex = [data[@"partIndex"] integerValue];
 
-            @try {
-                IMMessageItem *messageItem = (IMMessageItem *)message._imMessageItem;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *editError = nil;
+                @try {
+                    IMMessageItem *messageItem = (IMMessageItem *)message._imMessageItem;
 
-                // Try Tahoe method first (has newPartTranslation parameter)
-                SEL tahoeSel = @selector(editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:);
-                if ([chat respondsToSelector:tahoeSel]) {
-                    [chat editMessageItem:(messageItem) atPartIndex:((long)partIndex) withNewPartText:(editedString) newPartTranslation:nil backwardCompatabilityText:(bcString)];
-                    DLog("BLUEBUBBLESHELPER: Edit succeeded with editMessageItem (newPartTranslation)");
+                    // Try Tahoe method first (has newPartTranslation parameter)
+                    SEL tahoeSel = @selector(editMessageItem:atPartIndex:withNewPartText:newPartTranslation:backwardCompatabilityText:);
+                    if ([chat respondsToSelector:tahoeSel]) {
+                        [chat editMessageItem:(messageItem) atPartIndex:((long)partIndex) withNewPartText:(editedString) newPartTranslation:nil backwardCompatabilityText:(bcString)];
+                        DLog("BLUEBUBBLESHELPER: Edit succeeded with editMessageItem (newPartTranslation)");
+                    }
+                    // Try macOS 14+ method
+                    else if ([chat respondsToSelector:@selector(editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:)]) {
+                        [chat editMessageItem:(messageItem) atPartIndex:((long)partIndex) withNewPartText:(editedString) backwardCompatabilityText:(bcString)];
+                        DLog("BLUEBUBBLESHELPER: Edit succeeded with editMessageItem");
+                    }
+                    // Try older method
+                    else if ([chat respondsToSelector:@selector(editMessage:atPartIndex:withNewPartText:backwardCompatabilityText:)]) {
+                        [chat editMessage:(message) atPartIndex:(partIndex) withNewPartText:(editedString) backwardCompatabilityText:(bcString)];
+                        DLog("BLUEBUBBLESHELPER: Edit succeeded with editMessage");
+                    } else {
+                        DLog("BLUEBUBBLESHELPER: No edit selector found");
+                        editError = @"No edit selector found";
+                    }
+                } @catch (NSException *e) {
+                    DLog("BLUEBUBBLESHELPER: Edit message exception: %@", e);
+                    editError = e.reason ?: @"Edit failed";
                 }
-                // Try macOS 14+ method
-                else if ([chat respondsToSelector:@selector(editMessageItem:atPartIndex:withNewPartText:backwardCompatabilityText:)]) {
-                    [chat editMessageItem:(messageItem) atPartIndex:((long)partIndex) withNewPartText:(editedString) backwardCompatabilityText:(bcString)];
-                    DLog("BLUEBUBBLESHELPER: Edit succeeded with editMessageItem");
+
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, editError != nil ? @{@"error": editError} : nil);
                 }
-                // Try older method
-                else if ([chat respondsToSelector:@selector(editMessage:atPartIndex:withNewPartText:backwardCompatabilityText:)]) {
-                    [chat editMessage:(message) atPartIndex:(partIndex) withNewPartText:(editedString) backwardCompatabilityText:(bcString)];
-                    DLog("BLUEBUBBLESHELPER: Edit succeeded with editMessage");
-                } else {
-                    DLog("BLUEBUBBLESHELPER: No edit selector found");
-                }
-            } @catch (NSException *e) {
-                DLog("BLUEBUBBLESHELPER: Edit message exception: %@", e);
-            }
+            });
         }];
-
-        if (transaction != nil) {
-            SendTransactionResponse(transaction, nil);
-        }
     // If the server tells us to unsend a message
     } else if ([event isEqualToString:@"unsend-message"]) {
         IMChat *chat = [self getIMChatFromGuid: data[@"chatGuid"] transaction: transaction];
 
-        [BlueBubblesHelper getMessageItem:(chat) :(data[@"messageGuid"]) completionBlock:^(IMMessage *message) {
-            [chat retractMessagePart:BBMessagePartForIndex(message, [data[@"partIndex"] integerValue], NO)];
-        }];
-
-        if (transaction != nil) {
-            SendTransactionResponse(transaction, nil);
+        if (chat == nil) {
+            return;
         }
+
+        [BlueBubblesHelper getMessageItem:(chat) :(data[@"messageGuid"]) completionBlock:^(IMMessage *message) {
+            if (message == nil) {
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, @{@"error": @"Message not found"});
+                }
+                return;
+            }
+            NSInteger partIndex = [data[@"partIndex"] integerValue];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [chat retractMessagePart:BBMessagePartForIndex(message, partIndex, NO)];
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, nil);
+                }
+            });
+        }];
     // If the server tells us to create a chat
     } else if ([event isEqualToString:@"create-chat"]) {
         NSString *requestedService = [data[@"service"] isKindOfClass:[NSString class]] ? data[@"service"] : @"";
@@ -469,7 +499,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
             }
         }
 
-        if (failed) {
+        if (failed || handles.count == 0) {
             if (transaction != nil) {
                 SendTransactionResponse(transaction, @{@"error": @"Failed to find all handles for specified service!"});
             }
@@ -505,70 +535,101 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
 
         if (chat != nil) {
             [BlueBubblesHelper getMessageItem:(chat) :(data[@"messageGuid"]) completionBlock:^(IMMessage *message) {
-                IMMessageItem *messageItem = (IMMessageItem *)message._imMessageItem;
-                // Use deleteIMMessageItems: (whole-message delete) rather than
-                // deleteChatItems: (message-parts delete). The latter hits
-                // IMCore's "delete subset of chat items from message → update
-                // message" path which leaves the row in place; only
-                // deleteIMMessageItems: actually removes the message and
-                // writes to sync_deleted_messages so the delete propagates
-                // via iCloud. Observed on macOS 26 Tahoe; previously the
-                // API returned 200 but chat.db was unchanged.
-                if (messageItem != nil) {
-                    [chat deleteIMMessageItems:@[messageItem]];
+                if (message == nil) {
+                    if (transaction != nil) {
+                        SendTransactionResponse(transaction, @{@"error": @"Message not found"});
+                    }
+                    return;
                 }
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    IMMessageItem *messageItem = (IMMessageItem *)message._imMessageItem;
+                    // Use deleteIMMessageItems: (whole-message delete) rather than
+                    // deleteChatItems: (message-parts delete). The latter hits
+                    // IMCore's "delete subset of chat items from message → update
+                    // message" path which leaves the row in place; only
+                    // deleteIMMessageItems: actually removes the message and
+                    // writes to sync_deleted_messages so the delete propagates
+                    // via iCloud. Observed on macOS 26 Tahoe; previously the
+                    // API returned 200 but chat.db was unchanged.
+                    if (messageItem != nil) {
+                        [chat deleteIMMessageItems:@[messageItem]];
+                    }
+                    if (transaction != nil) {
+                        SendTransactionResponse(transaction, nil);
+                    }
+                });
             }];
-
-            if (transaction != nil) {
-                SendTransactionResponse(transaction, nil);
-            }
         }
     // If the server tells us to send a single attachment
     } else if ([event isEqualToString:@"send-attachment"]) {
-        NSString *filePath = data[@"filePath"];
+        NSString *filePath = [data[@"filePath"] isKindOfClass:[NSString class]] ? data[@"filePath"] : nil;
+        if (filePath.length == 0) {
+            if (transaction != nil) {
+                SendTransactionResponse(transaction, @{@"error": @"Missing attachment filePath"});
+            }
+            return;
+        }
         NSURL * fileUrl = [NSURL fileURLWithPath:filePath];
-        IMFileTransfer* fileTransfer = [BlueBubblesHelper prepareFileTransferForAttachment:fileUrl filename:[fileUrl lastPathComponent]];
+        NSString *filename = [fileUrl lastPathComponent] ?: @"attachment";
+        IMFileTransfer* fileTransfer = [BlueBubblesHelper prepareFileTransferForAttachment:fileUrl filename:filename];
+        NSString *transferGuid = [fileTransfer guid];
+        if (transferGuid == nil) {
+            if (transaction != nil) {
+                SendTransactionResponse(transaction, @{@"error": @"Failed to prepare attachment transfer"});
+            }
+            return;
+        }
         NSMutableAttributedString *attachmentStr = [[NSMutableAttributedString alloc] initWithString: @"\ufffc"];
         [attachmentStr addAttributes:@{
             @"__kIMBaseWritingDirectionAttributeName": @"-1",
-            @"__kIMFileTransferGUIDAttributeName": fileTransfer.guid,
-            @"__kIMFilenameAttributeName": [fileUrl lastPathComponent],
+            @"__kIMFileTransferGUIDAttributeName": transferGuid,
+            @"__kIMFilenameAttributeName": filename,
             @"__kIMMessagePartAttributeName": @0,
         } range:NSMakeRange(0, 1)];
-        [BlueBubblesHelper sendMessage:(data) transfers:@[[fileTransfer guid]] attributedString:attachmentStr transaction:(transaction)];
+        [BlueBubblesHelper sendMessage:(data) transfers:@[transferGuid] attributedString:attachmentStr transaction:(transaction)];
     // If the server tells us to send a single attachment
     } else if ([event isEqualToString:@"send-multipart"]) {
         NSMutableAttributedString *attributedString = [[NSMutableAttributedString alloc] initWithString: @""];
         NSMutableArray<NSString*> *transfers = [[NSMutableArray alloc] init];
         for (NSDictionary *dict in data[@"parts"]) {
-            NSUInteger index = [dict[@"partIndex"] integerValue];
-            if (dict[@"filePath"] != [NSNull null] && [dict[@"filePath"] length] != 0) {
-                NSString *filePath = dict[@"filePath"];
-                NSURL * fileUrl = [NSURL fileURLWithPath:filePath];
-                IMFileTransfer* fileTransfer = [BlueBubblesHelper prepareFileTransferForAttachment:fileUrl filename:[fileUrl lastPathComponent]];
-                [transfers addObject:[fileTransfer guid]];
+            if (![dict isKindOfClass:[NSDictionary class]]) {
+                continue;
+            }
+            NSInteger index = [dict[@"partIndex"] integerValue];
+            NSString *partFilePath = [dict[@"filePath"] isKindOfClass:[NSString class]] ? dict[@"filePath"] : nil;
+            if (partFilePath.length != 0) {
+                NSURL * fileUrl = [NSURL fileURLWithPath:partFilePath];
+                NSString *filename = [fileUrl lastPathComponent] ?: @"attachment";
+                IMFileTransfer* fileTransfer = [BlueBubblesHelper prepareFileTransferForAttachment:fileUrl filename:filename];
+                NSString *transferGuid = [fileTransfer guid];
+                if (transferGuid == nil) {
+                    continue;
+                }
+                [transfers addObject:transferGuid];
                 NSMutableAttributedString *attachmentStr = [[NSMutableAttributedString alloc] initWithString: @"\ufffc"];
                 [attachmentStr addAttributes:@{
                     @"__kIMBaseWritingDirectionAttributeName": @"-1",
-                    @"__kIMFileTransferGUIDAttributeName": fileTransfer.guid,
-                    @"__kIMFilenameAttributeName": [fileUrl lastPathComponent],
-                    @"__kIMMessagePartAttributeName": [NSNumber numberWithInt:index],
+                    @"__kIMFileTransferGUIDAttributeName": transferGuid,
+                    @"__kIMFilenameAttributeName": filename,
+                    @"__kIMMessagePartAttributeName": @(index),
                 } range:NSMakeRange(0, 1)];
                 [attributedString appendAttributedString:attachmentStr];
             } else {
-                if (dict[@"mention"] != [NSNull null] && [dict[@"mention"] length] != 0) {
-                    NSMutableAttributedString *mentionStr = [[NSMutableAttributedString alloc] initWithString: dict[@"text"]];
+                NSString *partText = [dict[@"text"] isKindOfClass:[NSString class]] ? dict[@"text"] : @"";
+                NSString *mention = [dict[@"mention"] isKindOfClass:[NSString class]] ? dict[@"mention"] : nil;
+                if (mention.length != 0) {
+                    NSMutableAttributedString *mentionStr = [[NSMutableAttributedString alloc] initWithString:partText];
                     [mentionStr addAttributes:@{
                         @"__kIMBaseWritingDirectionAttributeName": @"-1",
-                        @"__kIMMentionConfirmedMention": dict[@"mention"],
-                        @"__kIMMessagePartAttributeName": [NSNumber numberWithInt:index],
+                        @"__kIMMentionConfirmedMention": mention,
+                        @"__kIMMessagePartAttributeName": @(index),
                     } range:NSMakeRange(0, [[mentionStr string] length])];
                     [attributedString appendAttributedString:mentionStr];
                 } else {
-                    NSMutableAttributedString *messageStr = [[NSMutableAttributedString alloc] initWithString: dict[@"text"]];
+                    NSMutableAttributedString *messageStr = [[NSMutableAttributedString alloc] initWithString:partText];
                     [messageStr addAttributes:@{
                         @"__kIMBaseWritingDirectionAttributeName": @"-1",
-                        @"__kIMMessagePartAttributeName": [NSNumber numberWithInt:index],
+                        @"__kIMMessagePartAttributeName": @(index),
                     } range:NSMakeRange(0, [[messageStr string] length])];
                     [attributedString appendAttributedString:messageStr];
                 }
@@ -596,7 +657,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                         NSString *path = [(NSURL *)[digitalTouch assetURL] absoluteString];
                         DLog("BLUEBUBBLESHELPER: Digital Touch generated! %@", path);
                         if (transaction != nil) {
-                            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"path": path}];
+                            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"path": path ?: [NSNull null]}];
                         }
                     }];
                 } else if ([temp isKindOfClass:handwrittenClass]) {
@@ -606,7 +667,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                         NSString *path = [(NSURL *)url absoluteString];
                         DLog("BLUEBUBBLESHELPER: Handwritten Message generated! %@", path);
                         if (transaction != nil) {
-                            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"path": path}];
+                            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"path": path ?: [NSNull null]}];
                         }
                     }];
                 }
@@ -691,8 +752,9 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
         }];
     // If the server tells us to check iMessage availability
     } else if ([event isEqualToString:@"check-imessage-availability"] || [event isEqualToString:@"check-facetime-availability"]) {
-        NSString *type = data[@"aliasType"];
-        IDSDestination *dest;
+        NSString *type = [data[@"aliasType"] isKindOfClass:[NSString class]] ? data[@"aliasType"] : nil;
+        NSString *address = [data[@"address"] isKindOfClass:[NSString class]] ? data[@"address"] : nil;
+        IDSDestination *dest = nil;
         NSString* serviceName;
 
         if ([event isEqualToString:@"check-imessage-availability"]) {
@@ -701,27 +763,36 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
             serviceName = IDSServiceNameFaceTime;
         }
 
-        if ([type isEqualToString:@"phone"]) {
-            dest = IDSCopyIDForPhoneNumber((__bridge CFStringRef)data[@"address"]);
-        } else {
-            dest = IDSCopyIDForEmailAddress((__bridge CFStringRef)data[@"address"]);
+        if (address.length > 0) {
+            if ([type isEqualToString:@"phone"]) {
+                dest = IDSCopyIDForPhoneNumber((__bridge CFStringRef)address);
+            } else {
+                dest = IDSCopyIDForEmailAddress((__bridge CFStringRef)address);
+            }
         }
 
-        [[IDSIDQueryController sharedInstance] forceRefreshIDStatusForDestinations:(@[dest]) service:(serviceName) listenerID:(@"SOIDSListener-com.apple.imessage-rest") queue:(dispatch_queue_create("HandleIDS", NULL)) completionBlock:^(NSDictionary *response) {
-            NSInteger *status = [response.allValues.firstObject integerValue];
-            BOOL available = status == 1;
-            DLog("BLUEBUBBLESHELPER: Status for %{public}@ is %{public}ld", data[@"address"], (long)available);
+        if (dest == nil) {
             if (transaction != nil) {
-                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"available": [NSNumber numberWithBool:(available)]}];
+                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Missing or invalid address for availability check"}];
             }
-        }];
+        } else {
+            [[IDSIDQueryController sharedInstance] forceRefreshIDStatusForDestinations:(@[dest]) service:(serviceName) listenerID:(@"SOIDSListener-com.apple.imessage-rest") queue:(dispatch_queue_create("HandleIDS", NULL)) completionBlock:^(NSDictionary *response) {
+                NSInteger *status = [response.allValues.firstObject integerValue];
+                BOOL available = status == 1;
+                DLog("BLUEBUBBLESHELPER: Status for %{public}@ is %{public}ld", address, (long)available);
+                if (transaction != nil) {
+                    [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"available": [NSNumber numberWithBool:(available)]}];
+                }
+            }];
+        }
     // If the server tells us to download a purged attachment
     } else if ([event isEqualToString:@"download-purged-attachment"]) {
         IMFileTransfer* transfer = [[IMFileTransferCenter sharedInstance] transferForGUID:(data[@"attachmentGuid"])];
-        if ([transfer transferState] != 0 || ![transfer isIncoming]) {
+        if (transfer == nil || [transfer transferState] != 0 || ![transfer isIncoming]) {
             if (transaction != nil) {
                 [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"No need to unpurge!"}];
             }
+            return;
         }
 
         [[IMFileTransferCenter sharedInstance] registerTransferWithDaemon:([transfer guid])];
@@ -829,6 +900,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
             [session getFriendsSharingLocationsWithMeWithCompletion:^(NSArray *friends) {
                 for (NSObject* friend in friends) {
                     NSObject* handle = [friend performSelector:(NSSelectorFromString(@"handle"))];
+                    if (handle == nil) continue;
                     DLog("BLUEBUBBLESHELPER: test: %@", handle);
                     [session startRefreshingLocationForHandles:@[handle] priority:(1000) isFromGroup:FALSE reverseGeocode:TRUE completion:^() {
                         NSObject *test = [session cachedLocationForHandle:handle includeAddress:TRUE];
@@ -906,7 +978,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
             if (transaction != nil) {
                 NSDictionary *data = @{
                     @"transactionId": transaction,
-                    @"error": err,
+                    @"error": err ?: @"Unknown search error",
                 };
                 [[NetworkController sharedInstance] sendMessage: data];
             }
@@ -1127,7 +1199,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [strongChat sendMessage:(strongMessage)];
                     if (transaction != nil) {
-                        [[NetworkController sharedInstance]sendMessage:@{@"transactionId": transaction, @"identifier": [[strongChat lastSentMessage] guid]}];
+                        [[NetworkController sharedInstance]sendMessage:@{@"transactionId": transaction, @"identifier": [[strongChat lastSentMessage] guid] ?: [NSNull null]}];
                     }
                 });
              }];
@@ -1135,13 +1207,13 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
             [[IMDDController sharedInstance] scanMessage:messageToSend outgoing:TRUE waitUntilDone:TRUE completionBlock:^(NSObject* temp, NSObject* ddMessageToSend) {
                 [chat sendMessage:(ddMessageToSend)];
                 if (transaction != nil) {
-                    [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"identifier": [[chat lastSentMessage] guid]}];
+                    [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"identifier": [[chat lastSentMessage] guid] ?: [NSNull null]}];
                 }
             }];
         } else {
             [chat sendMessage:(messageToSend)];
             if (transaction != nil) {
-                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"identifier": [[chat lastSentMessage] guid]}];
+                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"identifier": [[chat lastSentMessage] guid] ?: [NSNull null]}];
             }
         }
     };
@@ -1215,7 +1287,16 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
 }
 
 - (void)searchMessages:(NSString *)searchQuery matchType:(NSString *)matchType completionBlock:(void (^)(NSMutableArray<NSString *> *results))onComplete errorBlock:(void (^)(NSString *err))onError {
-    NSString *queryString = [NSString stringWithFormat:@"kMDItemTextContent=\"%@\"cwdt", searchQuery];
+    if (![searchQuery isKindOfClass:[NSString class]] || searchQuery.length == 0) {
+        if (onError) {
+            onError(@"Search query must be a non-empty string");
+        }
+        return;
+    }
+
+    NSString *escapedQuery = [[searchQuery stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+        stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+    NSString *queryString = [NSString stringWithFormat:@"kMDItemTextContent=\"%@\"cwdt", escapedQuery];
     
     // c -> Performs a case-insensitive search.
     // d -> Performs a search that ignores diacritical marks.
@@ -1226,7 +1307,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     // That's why when the matchType is exact, we exclude it.
     // I'm not sure how to do a true exact match query.
     if ([matchType isEqualToString:@"exact"]) {
-        queryString = [NSString stringWithFormat:@"kMDItemTextContent=\"%@\"cwd", searchQuery];
+        queryString = [NSString stringWithFormat:@"kMDItemTextContent=\"%@\"cwd", escapedQuery];
     }
     
     if ([[NSProcessInfo processInfo] operatingSystemVersion].majorVersion < 13) {
@@ -1300,7 +1381,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
         for (NSObject* alias in aliases) {
             NSDictionary* info = [account _aliasInfoForAlias:(alias)];
             if (info == nil) {
-                [returnedAliases addObject: @{@"Alias": alias}];
+                [returnedAliases addObject: @{@"Alias": alias ?: [NSNull null]}];
             } else {
                 [returnedAliases addObject: info];
             }
@@ -1357,6 +1438,7 @@ ZKSwizzleInterface(BBH_FMFSessionDataManager, FMFSessionDataManager , NSObject)
 @implementation BBH_FMFSessionDataManager
 
 - (void)setLocations:(id)arg1 {
+    ZKOrig(void, arg1);
     Class class = NSClassFromString(@"FMFSessionDataManager");
     NSSet* locations = [[class sharedInstance] locations];
     DLog("BLUEBUBBLESHELPER: Got new locations: %{public}@", locations);
@@ -1397,7 +1479,6 @@ ZKSwizzleInterface(BBH_FMFSessionDataManager, FMFSessionDataManager , NSObject)
             [[NetworkController sharedInstance] sendMessage: data];
         }
     }
-    return ZKOrig(void, arg1);
 }
 
 @end

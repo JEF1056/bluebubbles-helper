@@ -135,11 +135,45 @@ static void RichLinkStep(NSString *step, id result) {
         }
 
         // Resolve avatar image data + on-disk path. IMNicknameAvatarImage prefers a path Apple controls.
+        static const unsigned long long kNicknameMaxAvatarBytes = 20ULL * 1024ULL * 1024ULL;
         NSData *imageData = nil;
+        NSString *resolvedAvatarPath = nil;
         if (avatarPath != nil) {
-            imageData = [NSData dataWithContentsOfFile:avatarPath];
+            NSString *resolved = [[avatarPath stringByStandardizingPath] stringByResolvingSymlinksInPath];
+            NSString *root = [[[BlueBubblesHelper richLinkImageRoot] stringByStandardizingPath] stringByResolvingSymlinksInPath];
+            NSError *readError = nil;
+            NSString *rejected = nil;
+            if (root == nil || ![resolved hasPrefix:[root stringByAppendingString:@"/"]]) {
+                rejected = @"avatarPath outside the attachment store";
+            } else {
+                NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:resolved error:&readError];
+                if (attrs == nil || ![[attrs fileType] isEqualToString:NSFileTypeRegular]) {
+                    rejected = @"avatarPath is not a regular file";
+                } else if ([attrs fileSize] > kNicknameMaxAvatarBytes) {
+                    rejected = @"avatarPath exceeds 20MB limit";
+                } else {
+                    imageData = [NSData dataWithContentsOfFile:resolved options:0 error:&readError];
+                    if (imageData == nil) {
+                        rejected = @"failed to read avatarPath";
+                    } else {
+                        resolvedAvatarPath = resolved;
+                    }
+                }
+            }
+            if (rejected != nil) {
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, @{@"error": rejected});
+                }
+                return YES;
+            }
         } else if (avatarBytes != nil) {
             imageData = [[NSData alloc] initWithBase64EncodedString:avatarBytes options:NSDataBase64DecodingIgnoreUnknownCharacters];
+            if (imageData != nil && [imageData length] > kNicknameMaxAvatarBytes) {
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, @{@"error": @"avatarBytes exceeds 20MB limit"});
+                }
+                return YES;
+            }
         }
 
         IMNicknameAvatarImage *avatar = nil;
@@ -147,9 +181,9 @@ static void RichLinkStep(NSString *step, id result) {
             // Copy bytes into the path Apple expects so the avatar persists across syncs.
             NSString *destPath = [IMNickname uniqueFilePathForWritingImageData];
             NSError *writeError = nil;
-            avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageData:imageData imageFilePath:(destPath ?: avatarPath) error:&writeError];
-            if (avatar == nil && avatarPath != nil) {
-                avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageFilePath:avatarPath];
+            avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageData:imageData imageFilePath:(destPath ?: resolvedAvatarPath) error:&writeError];
+            if (avatar == nil && resolvedAvatarPath != nil) {
+                avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageFilePath:resolvedAvatarPath];
             }
         }
 
@@ -192,7 +226,13 @@ static void RichLinkStep(NSString *step, id result) {
 // Sends the link as plain text instead. This also sends the reply for the transaction.
 + (void)richLinkFallback:(NSString *)why data:(NSDictionary *)data url:(NSURL *)url transaction:(NSString *)transaction {
     RichLinkStep(@"fallback", [@"plain url, " stringByAppendingString:why]);
-    [BlueBubblesHelper sendMessage:@{@"chatGuid": data[@"chatGuid"], @"message": [url absoluteString]} transfers:nil attributedString:nil transaction:transaction];
+    NSString *chatGuid = [data[@"chatGuid"] isKindOfClass:[NSString class]] ? data[@"chatGuid"] : nil;
+    NSString *urlText = [url absoluteString];
+    if (chatGuid.length == 0 || urlText.length == 0) {
+        [self richLinkFail:why transaction:transaction];
+        return;
+    }
+    [BlueBubblesHelper sendMessage:@{@"chatGuid": chatGuid, @"message": urlText} transfers:nil attributedString:nil transaction:transaction];
 }
 
 // Builds the RichLink keyed archive Messages uses for a link balloon (an LPLinkMetadata, with the image

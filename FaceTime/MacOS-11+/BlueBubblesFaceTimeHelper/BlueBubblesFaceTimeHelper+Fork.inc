@@ -677,9 +677,11 @@
         __block NSUInteger remainingLinks = [linksToInvalidate count];
         __block BOOL anyInvalidated = NO;
         __block BOOL replied = NO;
+        NSMutableArray *retainedClients = [NSMutableArray array];
         void (^finishReply)(void) = ^{
             if (replied) return;
             replied = YES;
+            [retainedClients removeAllObjects];
             BBSendReply(replyController, transaction, @{
                 @"ended": @YES,
                 @"kicked_count": @(kickedCount),
@@ -692,8 +694,13 @@
         });
 
         for (TUConversationLink *link in linksToInvalidate) {
+            __block TUConversationManagerXPCClient *xpcClient = nil;
             void (^onDone)(BOOL, NSError *) = ^(BOOL ok, NSError *err) {
                 dispatch_async(dispatch_get_main_queue(), ^{
+                    if (xpcClient != nil) {
+                        [retainedClients removeObject:xpcClient];
+                        xpcClient = nil;
+                    }
                     if (ok || err == nil) anyInvalidated = YES;
                     remainingLinks--;
                     if (remainingLinks == 0) finishReply();
@@ -702,7 +709,13 @@
             if ([manager respondsToSelector:@selector(invalidateLink:completionHandler:)]) {
                 [manager invalidateLink:link completionHandler:onDone];
             } else {
-                [[[TUConversationManagerXPCClient alloc] init] invalidateLink:link completionHandler:onDone];
+                xpcClient = [[TUConversationManagerXPCClient alloc] init];
+                if (xpcClient != nil) {
+                    [retainedClients addObject:xpcClient];
+                    [xpcClient invalidateLink:link completionHandler:onDone];
+                } else {
+                    onDone(NO, nil);
+                }
             }
         }
         return YES;

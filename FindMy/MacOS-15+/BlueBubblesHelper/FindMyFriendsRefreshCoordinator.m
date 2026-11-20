@@ -179,7 +179,8 @@ static os_log_t refreshLog;
                        unidentifiedFriendCount:unidentifiedFriendCount];
         }
         self.responseHandler(response);
-        if (focusedLocationHandle != nil &&
+        if (!self.preserveFocusedLiveRefresh &&
+            focusedLocationHandle != nil &&
             [self.session respondsToSelector:@selector(stopRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
             // Drop the temporary priority-2 stream so targeted polls do not leak live battery drain.
             [self.session stopRefreshingLocationForHandles:@[focusedLocationHandle]

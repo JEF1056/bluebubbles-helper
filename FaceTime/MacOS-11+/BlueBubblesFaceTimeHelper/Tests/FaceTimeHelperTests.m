@@ -502,6 +502,69 @@ static void TestPlayDtmf(BLUEBUBBLESFACETIMEHELPER *helper) {
     printf("PASS: TestPlayDtmf\n");
 }
 
+@interface FakeFramingSocket : GCDAsyncSocket
+@property (nonatomic, strong) NSMutableArray<NSData *> *writtenData;
+@end
+
+@implementation FakeFramingSocket
+- (instancetype)init {
+    self = [super initWithDelegate:nil delegateQueue:dispatch_get_main_queue()];
+    if (self) {
+        _writtenData = [NSMutableArray array];
+    }
+    return self;
+}
+- (void)readDataToData:(NSData *)data withTimeout:(NSTimeInterval)timeout maxLength:(NSUInteger)length tag:(long)tag {
+    (void)data; (void)timeout; (void)length; (void)tag;
+}
+- (void)writeData:(NSData *)data withTimeout:(NSTimeInterval)timeout tag:(long)tag {
+    (void)timeout; (void)tag;
+    if (data != nil) [self.writtenData addObject:data];
+}
+- (void)disconnect {
+}
+@end
+
+static void TestNetworkControllerFramingAndTypeGuards(BLUEBUBBLESFACETIMEHELPER *helper) {
+    NetworkController *nc = [[NetworkController alloc] init];
+    FakeFramingSocket *fakeSock = [[FakeFramingSocket alloc] init];
+    [nc setValue:fakeSock forKey:@"asyncSocket"];
+
+    NSMutableArray<NSString *> *frames = [NSMutableArray array];
+    nc.messageReceivedBlock = ^(id sender, NSString *msg) {
+        (void)sender;
+        [frames addObject:msg];
+    };
+
+    // 1. Split UTF-8 frame + CRLF + multi-frame chunk + invalid UTF-8 frame + empty line
+    [nc socket:fakeSock didReadData:[@"{\"a\":1}\r" dataUsingEncoding:NSUTF8StringEncoding] withTag:1];
+    AssertTrue(frames.count == 0, @"Incomplete frame without LF must stay buffered");
+
+    NSMutableData *chunk2 = [NSMutableData dataWithData:[@"\n\n{\"b\":\"hi\"}\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    const uint8_t badUtf8[] = {0xFF, 0xFE, 0x0A};
+    [chunk2 appendBytes:badUtf8 length:sizeof(badUtf8)];
+    [chunk2 appendData:[@"{\"ok\":true}\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    [nc socket:fakeSock didReadData:chunk2 withTag:1];
+
+    AssertTrue(frames.count == 3, @"Expected 3 valid UTF-8 frames (empty and invalid UTF-8 skipped)");
+    AssertTrue([frames[0] isEqualToString:@"{\"a\":1}"], @"First frame must strip trailing CR");
+    AssertTrue([frames[1] isEqualToString:@"{\"b\":\"hi\"}"], @"Second frame must decode cleanly");
+    AssertTrue([frames[2] isEqualToString:@"{\"ok\":true}"], @"Valid frame after invalid UTF-8 must decode");
+
+    // 2. handleMessage type guards must ignore non-dict JSON and bad data without crashing
+    [helper handleMessage:nc message:@"[]"];
+    [helper handleMessage:nc message:@"{bad-json"];
+    [helper handleMessage:nc message:JsonString(@{@"action": @"start-call", @"transactionId": @"tx-bad", @"data": @"not-a-dict"})];
+
+    // 3. sendMessage nil / non-serializable guard must not write "(null)"
+    NSUInteger countBefore = fakeSock.writtenData.count;
+    [nc sendMessage:(id)@"not-a-dict"];
+    [nc sendMessage:@{@"bad": [NSDate date]}];
+    AssertTrue(fakeSock.writtenData.count == countBefore, @"Invalid sendMessage must not write to socket");
+
+    printf("PASS: TestNetworkControllerFramingAndTypeGuards\n");
+}
+
 int main(void) {
     @autoreleasepool {
         gMockCalls = [NSMutableDictionary dictionary];
@@ -525,6 +588,7 @@ int main(void) {
         TestStartCall(helper);
         TestGenerateLink(helper);
         TestPlayDtmf(helper);
+        TestNetworkControllerFramingAndTypeGuards(helper);
 
         // Test end-and-invalidate-call
         MockConversationLink *endLink = [[MockConversationLink alloc] init];

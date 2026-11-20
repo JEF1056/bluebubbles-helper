@@ -9,6 +9,7 @@ typedef void (^FindMyFriendsRefreshResponseHandler)(NSDictionary *response);
 @interface FindMyFriendsRefreshCoordinator : NSObject
 
 @property (nonatomic, assign) BOOL preserveFocusedLiveRefresh;
+@property (nonatomic, copy, nullable, readonly) NSString *focusedHandle;
 
 - (instancetype)initWithSession:(id<FindMyLocateSessionProtocol>)session
            transactionIdentifier:(nullable NSString *)transactionIdentifier
