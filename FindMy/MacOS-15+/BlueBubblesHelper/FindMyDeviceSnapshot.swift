@@ -56,14 +56,9 @@ enum FindMyDeviceSnapshot {
         }
 
         var device: [String: Any] = ["identifier": identifier]
-        copyString(named: "name", from: value, to: &device)
-        copyString(named: "displayName", from: value, to: &device)
-        copyString(named: "model", from: value, to: &device)
-        copyString(named: "rawDeviceModel", from: value, to: &device)
-        copyString(named: "systemVersion", from: value, to: &device)
-        copyString(named: "discoveryIdentifier", from: value, to: &device)
-        copyString(named: "baIdentifier", from: value, to: &device)
-        copyString(named: "category", from: value, to: &device)
+        for key in ["name", "displayName", "model", "rawDeviceModel", "systemVersion", "discoveryIdentifier", "baIdentifier", "category"] {
+            copyString(named: key, from: value, to: &device)
+        }
 
         if let batteryLevel = number(child(named: "batteryLevel", in: value)) {
             device["batteryLevel"] = batteryLevel
@@ -93,10 +88,9 @@ enum FindMyDeviceSnapshot {
         }
 
         var serializedAddress: [String: Any] = [:]
-        copyString(named: "label", from: address, to: &serializedAddress)
-        copyString(named: "countryCode", from: address, to: &serializedAddress)
-        copyString(named: "administrativeArea", from: address, to: &serializedAddress)
-        copyString(named: "locality", from: address, to: &serializedAddress)
+        for key in ["label", "countryCode", "administrativeArea", "locality"] {
+            copyString(named: key, from: address, to: &serializedAddress)
+        }
 
         if let formattedAddress = firstString(
             named: ["mapItemFormattedAddress", "largeAddressModern", "mediumAddressModern", "label"],
@@ -145,14 +139,10 @@ enum FindMyDeviceSnapshot {
         } else if let floorLevel = coreLocation.floor?.level {
             serializedLocation["floorLevel"] = floorLevel
         }
-        if let isInaccurate = boolean(child(named: "isInaccurate", in: locationWrapper)) {
-            serializedLocation["isInaccurate"] = isInaccurate
-        }
-        if let isOld = boolean(child(named: "isOld", in: locationWrapper)) {
-            serializedLocation["isOld"] = isOld
-        }
-        if let isLocationFinished = boolean(child(named: "isLocationFinished", in: locationWrapper)) {
-            serializedLocation["locationFinished"] = isLocationFinished
+        for (sourceKey, destKey) in [("isInaccurate", "isInaccurate"), ("isOld", "isOld"), ("isLocationFinished", "locationFinished")] {
+            if let flag = boolean(child(named: sourceKey, in: locationWrapper)) {
+                serializedLocation[destKey] = flag
+            }
         }
         if let locationType = enumCase(child(named: "locationType", in: locationWrapper)) {
             serializedLocation["positionType"] = locationType

@@ -47,6 +47,14 @@ static const long long BBLiveLocationRefreshPriority = 2;
 - (void)sendError:(NSString *)errorMessage transactionIdentifier:(nullable NSString *)transactionIdentifier;
 @end
 
+static NSString * _Nullable BBTrimmedString(id _Nullable value) {
+    if (![value isKindOfClass:[NSString class]]) {
+        return nil;
+    }
+    NSString *trimmed = [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return trimmed.length > 0 ? trimmed : nil;
+}
+
 @implementation FindMyHelper
 
 static os_log_t helperLog;
@@ -157,15 +165,32 @@ static os_log_t helperLog;
     });
 }
 
-- (void)sendError:(NSString *)errorMessage transactionIdentifier:(nullable NSString *)transactionIdentifier {
-    os_log_error(helperLog, "%{public}@", errorMessage);
+- (void)sendTransactionResponse:(nullable NSString *)transactionIdentifier payload:(NSDictionary *)payload {
     if (transactionIdentifier == nil) {
         return;
     }
-    [[ServerConnection sharedInstance] sendMessage:@{
-        @"transactionId": transactionIdentifier,
-        @"error": errorMessage,
-    }];
+    NSMutableDictionary *message = [payload mutableCopy];
+    message[@"transactionId"] = transactionIdentifier;
+    [[ServerConnection sharedInstance] sendMessage:message];
+}
+
+- (void)adjustInFlightRefreshCountForIdentifier:(nullable NSString *)identifier delta:(NSInteger)delta {
+    if (identifier.length == 0 || delta == 0) {
+        return;
+    }
+    @synchronized (self.inFlightRefreshHandleCounts) {
+        NSInteger next = [self.inFlightRefreshHandleCounts[identifier] integerValue] + delta;
+        if (next <= 0) {
+            [self.inFlightRefreshHandleCounts removeObjectForKey:identifier];
+        } else {
+            self.inFlightRefreshHandleCounts[identifier] = @(next);
+        }
+    }
+}
+
+- (void)sendError:(NSString *)errorMessage transactionIdentifier:(nullable NSString *)transactionIdentifier {
+    os_log_error(helperLog, "%{public}@", errorMessage);
+    [self sendTransactionResponse:transactionIdentifier payload:@{@"error": errorMessage}];
 }
 
 - (nullable FindMyLocateSession *)locateSession {
@@ -356,24 +381,18 @@ static os_log_t helperLog;
         return @[];
     }
     NSMutableArray<NSString *> *targets = [[NSMutableArray alloc] init];
-    NSArray<NSString *> *stringKeys = @[@"handle", @"displayName", @"name", @"fullName"];
-    for (NSString *key in stringKeys) {
-        id val = data[key];
-        if ([val isKindOfClass:[NSString class]]) {
-            NSString *trimmed = [(NSString *)val stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (trimmed.length > 0 && ![targets containsObject:trimmed]) {
-                [targets addObject:trimmed];
-            }
+    void (^addTarget)(id) = ^(id value) {
+        NSString *trimmed = BBTrimmedString(value);
+        if (trimmed != nil && ![targets containsObject:trimmed]) {
+            [targets addObject:trimmed];
         }
+    };
+    for (NSString *key in @[@"handle", @"displayName", @"name", @"fullName"]) {
+        addTarget(data[key]);
     }
     if ([data[@"handles"] isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)data[@"handles"]) {
-            if ([item isKindOfClass:[NSString class]]) {
-                NSString *trimmed = [(NSString *)item stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                if (trimmed.length > 0 && ![targets containsObject:trimmed]) {
-                    [targets addObject:trimmed];
-                }
-            }
+            addTarget(item);
         }
     }
     return targets;
@@ -381,15 +400,11 @@ static os_log_t helperLog;
 
 - (void)handleStartLiveLocationForTransactionIdentifier:(nullable NSString *)transactionIdentifier
                                                    data:(nullable NSDictionary *)data {
-    NSString *rawHandle = [data[@"handle"] isKindOfClass:[NSString class]] ? data[@"handle"] : nil;
-    if (rawHandle == nil && [data[@"handles"] isKindOfClass:[NSArray class]]) {
-        id first = [(NSArray *)data[@"handles"] firstObject];
-        if ([first isKindOfClass:[NSString class]]) {
-            rawHandle = first;
-        }
+    NSString *trimmedHandle = BBTrimmedString(data[@"handle"]);
+    if (trimmedHandle == nil && [data[@"handles"] isKindOfClass:[NSArray class]]) {
+        trimmedHandle = BBTrimmedString([(NSArray *)data[@"handles"] firstObject]);
     }
-    NSString *trimmedHandle = [rawHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmedHandle.length == 0) {
+    if (trimmedHandle == nil) {
         [self sendError:@"Missing handle for start-findmy-live-location" transactionIdentifier:transactionIdentifier];
         return;
     }
@@ -429,15 +444,12 @@ static os_log_t helperLog;
                 return;
             }
             if (sessionGen != strongSelf.liveSessionGeneration) {
-                if (transactionIdentifier != nil) {
-                    [[ServerConnection sharedInstance] sendMessage:@{
-                        @"transactionId": transactionIdentifier,
-                        @"live": @NO,
-                        @"superseded": @YES,
-                        @"handle": trimmedHandle,
-                        @"locations": @[],
-                    }];
-                }
+                [strongSelf sendTransactionResponse:transactionIdentifier payload:@{
+                    @"live": @NO,
+                    @"superseded": @YES,
+                    @"handle": trimmedHandle,
+                    @"locations": @[],
+                }];
                 return;
             }
             if (targetHandleObject == nil) {
@@ -455,10 +467,7 @@ static os_log_t helperLog;
             strongSelf.activeLiveNormalizedIdentifier = normalizedTarget;
             strongSelf.activeLiveHandleObject = targetHandleObject;
 
-            @synchronized (strongSelf.inFlightRefreshHandleCounts) {
-                NSInteger count = [strongSelf.inFlightRefreshHandleCounts[normalizedTarget] integerValue];
-                strongSelf.inFlightRefreshHandleCounts[normalizedTarget] = @(count + 1);
-            }
+            [strongSelf adjustInFlightRefreshCountForIdentifier:normalizedTarget delta:1];
 
             __block BOOL inFlightCountCleared = NO;
             void (^clearInFlightCount)(void) = ^{
@@ -467,13 +476,8 @@ static os_log_t helperLog;
                         return;
                     }
                     inFlightCountCleared = YES;
-                    NSInteger count = [strongSelf.inFlightRefreshHandleCounts[normalizedTarget] integerValue];
-                    if (count <= 1) {
-                        [strongSelf.inFlightRefreshHandleCounts removeObjectForKey:normalizedTarget];
-                    } else {
-                        strongSelf.inFlightRefreshHandleCounts[normalizedTarget] = @(count - 1);
-                    }
                 }
+                [strongSelf adjustInFlightRefreshCountForIdentifier:normalizedTarget delta:-1];
             };
 
             id cachedLocation = [FindMyFriendPayload cachedLocationForHandle:targetHandleObject session:session];
@@ -503,24 +507,19 @@ static os_log_t helperLog;
                 [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:updatedTargets];
             }
 
-            if (transactionIdentifier != nil) {
-                NSString *responseHandle = canonicalHandle ?: trimmedHandle;
-                [[ServerConnection sharedInstance] sendMessage:@{
-                    @"transactionId": transactionIdentifier,
-                    @"live": @YES,
-                    @"handle": responseHandle,
-                    @"locations": cachedPayload != nil ? @[cachedPayload] : @[],
-                }];
-            }
+            [strongSelf sendTransactionResponse:transactionIdentifier payload:@{
+                @"live": @YES,
+                @"handle": canonicalHandle ?: trimmedHandle,
+                @"locations": cachedPayload != nil ? @[cachedPayload] : @[],
+            }];
         }];
     });
 }
 
 - (void)handleStopLiveLocationForTransactionIdentifier:(nullable NSString *)transactionIdentifier
                                                   data:(nullable NSDictionary *)data {
-    NSString *rawHandle = [data[@"handle"] isKindOfClass:[NSString class]] ? data[@"handle"] : nil;
-    NSString *trimmedHandle = [rawHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    NSString *normalizedTarget = trimmedHandle.length > 0 ? trimmedHandle.lowercaseString : nil;
+    NSString *trimmedHandle = BBTrimmedString(data[@"handle"]);
+    NSString *normalizedTarget = trimmedHandle.lowercaseString;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         FindMyLocateSession *session = self.activeLocateSession;
@@ -529,14 +528,11 @@ static os_log_t helperLog;
         if (normalizedTarget != nil &&
             currentLiveIdentifier != nil &&
             ![currentLiveIdentifier isEqualToString:normalizedTarget]) {
-            if (transactionIdentifier != nil) {
-                [[ServerConnection sharedInstance] sendMessage:@{
-                    @"transactionId": transactionIdentifier,
-                    @"stopped": @NO,
-                    @"handle": trimmedHandle,
-                    @"activeHandle": currentLiveIdentifier,
-                }];
-            }
+            [self sendTransactionResponse:transactionIdentifier payload:@{
+                @"stopped": @NO,
+                @"handle": trimmedHandle,
+                @"activeHandle": currentLiveIdentifier,
+            }];
             return;
         }
 
@@ -549,13 +545,10 @@ static os_log_t helperLog;
 
         [self stopLiveRefreshForHandleObject:handleToStop normalizedIdentifier:stoppedIdentifier session:session];
 
-        if (transactionIdentifier != nil) {
-            [[ServerConnection sharedInstance] sendMessage:@{
-                @"transactionId": transactionIdentifier,
-                @"stopped": @(handleToStop != nil),
-                @"handle": stoppedIdentifier ?: [NSNull null],
-            }];
-        }
+        [self sendTransactionResponse:transactionIdentifier payload:@{
+            @"stopped": @(handleToStop != nil),
+            @"handle": stoppedIdentifier ?: [NSNull null],
+        }];
     });
 }
 
@@ -567,32 +560,22 @@ static os_log_t helperLog;
         return;
     }
 
-    NSString *rawHandle = [data[@"handle"] isKindOfClass:[NSString class]] ? data[@"handle"] : nil;
-    if (rawHandle == nil && [data[@"handles"] isKindOfClass:[NSArray class]]) {
+    NSString *focusedHandle = BBTrimmedString(data[@"handle"]);
+    if (focusedHandle == nil && [data[@"handles"] isKindOfClass:[NSArray class]]) {
         for (id item in (NSArray *)data[@"handles"]) {
-            if ([item isKindOfClass:[NSString class]]) {
-                NSString *candidate = [(NSString *)item stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                if (candidate.length > 0) {
-                    rawHandle = candidate;
-                    break;
-                }
+            focusedHandle = BBTrimmedString(item);
+            if (focusedHandle != nil) {
+                break;
             }
         }
     }
-    NSString *trimmedHandle = [rawHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    NSString *focusedHandle = trimmedHandle.length > 0 ? trimmedHandle : nil;
     NSArray<NSString *> *focusTargets = [self focusTargetsFromData:data];
     BOOL targetedOnly = focusedHandle != nil || focusTargets.count > 0;
     if (targetedOnly && focusTargets.count > 0) {
         [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:focusTargets];
     }
     NSString *normalizedFocusKey = focusedHandle.lowercaseString;
-    if (normalizedFocusKey != nil) {
-        @synchronized (self.inFlightRefreshHandleCounts) {
-            NSInteger count = [self.inFlightRefreshHandleCounts[normalizedFocusKey] integerValue];
-            self.inFlightRefreshHandleCounts[normalizedFocusKey] = @(count + 1);
-        }
-    }
+    [self adjustInFlightRefreshCountForIdentifier:normalizedFocusKey delta:1];
 
     __weak typeof(self) weakSelf = self;
     __block __weak FindMyFriendsRefreshCoordinator *weakCoordinator = nil;
@@ -607,16 +590,7 @@ static os_log_t helperLog;
             [[ServerConnection sharedInstance] sendMessage:response];
             FindMyHelper *strongSelf = weakSelf;
             if (strongSelf != nil) {
-                if (normalizedFocusKey != nil) {
-                    @synchronized (strongSelf.inFlightRefreshHandleCounts) {
-                        NSInteger count = [strongSelf.inFlightRefreshHandleCounts[normalizedFocusKey] integerValue];
-                        if (count <= 1) {
-                            [strongSelf.inFlightRefreshHandleCounts removeObjectForKey:normalizedFocusKey];
-                        } else {
-                            strongSelf.inFlightRefreshHandleCounts[normalizedFocusKey] = @(count - 1);
-                        }
-                    }
-                }
+                [strongSelf adjustInFlightRefreshCountForIdentifier:normalizedFocusKey delta:-1];
                 if (weakCoordinator != nil) {
                     [strongSelf.activeFriendRefreshes removeObject:weakCoordinator];
                 }

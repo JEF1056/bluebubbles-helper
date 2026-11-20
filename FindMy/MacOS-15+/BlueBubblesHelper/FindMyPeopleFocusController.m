@@ -110,43 +110,53 @@ static NSInteger BBHookedPeopleNumberOfRowsInSection(id self, SEL _cmd, id table
     return 0;
 }
 
-static id _Nullable BBIvarObjectValue(id object, const char *ivarName) {
-    if (object == nil || ivarName == NULL) {
-        return nil;
-    }
-    Class cursor = object_getClass(object);
-    while (cursor != Nil) {
-        Ivar ivar = class_getInstanceVariable(cursor, ivarName);
-        if (ivar != NULL) {
-            const char *encoding = ivar_getTypeEncoding(ivar);
-            if (encoding != NULL && encoding[0] == '@') {
-                return object_getIvar(object, ivar);
-            }
-            return nil;
-        }
-        cursor = class_getSuperclass(cursor);
-    }
-    return nil;
-}
-
-static BOOL *BBBoolIvarPtr(id object, const char *ivarName) {
+static Ivar _Nullable BBFindIvar(id object, const char *ivarName) {
     if (object == nil || ivarName == NULL) {
         return NULL;
     }
-    Class cursor = object_getClass(object);
-    while (cursor != Nil) {
+    for (Class cursor = object_getClass(object); cursor != Nil; cursor = class_getSuperclass(cursor)) {
         Ivar ivar = class_getInstanceVariable(cursor, ivarName);
         if (ivar != NULL) {
-            const char *encoding = ivar_getTypeEncoding(ivar);
-            ptrdiff_t offset = ivar_getOffset(ivar);
-            if (offset > 0 && (encoding == NULL || encoding[0] == 'B' || encoding[0] == 'c' || encoding[0] == '\0')) {
-                return (BOOL *)((uint8_t *)(__bridge void *)object + offset);
-            }
-            return NULL;
+            return ivar;
         }
-        cursor = class_getSuperclass(cursor);
     }
     return NULL;
+}
+
+static id _Nullable BBIvarObjectValue(id object, const char *ivarName) {
+    Ivar ivar = BBFindIvar(object, ivarName);
+    const char *encoding = ivar != NULL ? ivar_getTypeEncoding(ivar) : NULL;
+    return (encoding != NULL && encoding[0] == '@') ? object_getIvar(object, ivar) : nil;
+}
+
+static BOOL *BBBoolIvarPtr(id object, const char *ivarName) {
+    Ivar ivar = BBFindIvar(object, ivarName);
+    if (ivar == NULL) {
+        return NULL;
+    }
+    const char *encoding = ivar_getTypeEncoding(ivar);
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    if (offset > 0 && (encoding == NULL || encoding[0] == 'B' || encoding[0] == 'c' || encoding[0] == '\0')) {
+        return (BOOL *)((uint8_t *)(__bridge void *)object + offset);
+    }
+    return NULL;
+}
+
+static void BBAddUniqueTarget(NSMutableArray<NSString *> *list, NSMutableSet<NSString *> *seenLower, NSString *cleaned) {
+    if (cleaned.length == 0) {
+        return;
+    }
+    NSString *key = cleaned.lowercaseString;
+    if (![seenLower containsObject:key]) {
+        [seenLower addObject:key];
+        [list addObject:cleaned];
+    }
+}
+
+static void BBAddNonEmptyString(NSMutableArray<NSString *> *list, id value) {
+    if ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) {
+        [list addObject:value];
+    }
 }
 
 static BOOL BBReadBoolIvar(id object, const char *ivarName, BOOL *outValue) {
@@ -347,17 +357,8 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
     NSMutableArray<NSString *> *cleaned = [[NSMutableArray alloc] initWithCapacity:targets.count];
     NSMutableSet<NSString *> *seen = [[NSMutableSet alloc] initWithCapacity:targets.count];
     for (id item in targets) {
-        if (![item isKindOfClass:[NSString class]]) {
-            continue;
-        }
-        NSString *trimmed = BBCollapseWhitespace(BBStripSchemePrefix((NSString *)item));
-        if (trimmed.length == 0) {
-            continue;
-        }
-        NSString *key = trimmed.lowercaseString;
-        if (![seen containsObject:key]) {
-            [seen addObject:key];
-            [cleaned addObject:trimmed];
+        if ([item isKindOfClass:[NSString class]]) {
+            BBAddUniqueTarget(cleaned, seen, BBCollapseWhitespace(BBStripSchemePrefix((NSString *)item)));
         }
     }
     return cleaned;
@@ -585,43 +586,29 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
             [candidateTableViews addObject:obj];
         }
 
-        if ([obj respondsToSelector:@selector(rootViewController)]) {
-            id rootVC = [(id<BBFindMyUIKitProxy>)obj rootViewController];
-            if (rootVC != nil) {
-                [queue addObject:rootVC];
-            }
-        }
-        if ([obj respondsToSelector:@selector(presentedViewController)]) {
-            id presentedVC = [(id<BBFindMyUIKitProxy>)obj presentedViewController];
-            if (presentedVC != nil) {
-                [queue addObject:presentedVC];
-            }
-        }
-        if ([obj respondsToSelector:@selector(childViewControllers)]) {
-            NSArray *children = [(id<BBFindMyUIKitProxy>)obj childViewControllers];
-            if ([children isKindOfClass:[NSArray class]]) {
-                [queue addObjectsFromArray:children];
-            }
-        }
-        if ([obj respondsToSelector:@selector(viewControllers)]) {
-            NSArray *vcs = [(id<BBFindMyUIKitProxy>)obj viewControllers];
-            if ([vcs isKindOfClass:[NSArray class]]) {
-                [queue addObjectsFromArray:vcs];
-            }
-        }
-        if ([obj respondsToSelector:@selector(view)]) {
-            BOOL viewLoaded = ![obj respondsToSelector:@selector(isViewLoaded)] || [(id<BBFindMyUIKitProxy>)obj isViewLoaded];
-            if (viewLoaded) {
-                id view = [(id<BBFindMyUIKitProxy>)obj view];
-                if (view != nil) {
-                    [queue addObject:view];
+        for (NSString *selName in @[@"rootViewController", @"presentedViewController"]) {
+            SEL sel = NSSelectorFromString(selName);
+            if ([obj respondsToSelector:sel]) {
+                id child = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+                if (child != nil) {
+                    [queue addObject:child];
                 }
             }
         }
-        if ([obj respondsToSelector:@selector(subviews)]) {
-            NSArray *subviews = [(id<BBFindMyUIKitProxy>)obj subviews];
-            if ([subviews isKindOfClass:[NSArray class]]) {
-                [queue addObjectsFromArray:subviews];
+        for (NSString *selName in @[@"childViewControllers", @"viewControllers", @"subviews"]) {
+            SEL sel = NSSelectorFromString(selName);
+            if ([obj respondsToSelector:sel]) {
+                NSArray *children = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+                if ([children isKindOfClass:[NSArray class]]) {
+                    [queue addObjectsFromArray:children];
+                }
+            }
+        }
+        if ([obj respondsToSelector:@selector(view)] &&
+            (![obj respondsToSelector:@selector(isViewLoaded)] || [(id<BBFindMyUIKitProxy>)obj isViewLoaded])) {
+            id view = [(id<BBFindMyUIKitProxy>)obj view];
+            if (view != nil) {
+                [queue addObject:view];
             }
         }
     }
@@ -796,13 +783,8 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
         }
         if (friendMatched) {
             for (id token in friendTokens) {
-                if (![token isKindOfClass:[NSString class]]) {
-                    continue;
-                }
-                NSString *cleanToken = BBCollapseWhitespace((NSString *)token);
-                if (cleanToken.length > 0 && ![seenTargets containsObject:cleanToken.lowercaseString]) {
-                    [seenTargets addObject:cleanToken.lowercaseString];
-                    [expandedTargets addObject:cleanToken];
+                if ([token isKindOfClass:[NSString class]]) {
+                    BBAddUniqueTarget(expandedTargets, seenTargets, BBCollapseWhitespace((NSString *)token));
                 }
             }
         }
@@ -919,26 +901,14 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
 - (NSArray<NSString *> *)collectStringsFromCell:(id)cell {
     NSMutableArray<NSString *> *strings = [[NSMutableArray alloc] init];
     if ([cell respondsToSelector:@selector(accessibilityLabel)]) {
-        NSString *label = [(id<BBFindMyUIKitProxy>)cell accessibilityLabel];
-        if ([label isKindOfClass:[NSString class]] && label.length > 0) {
-            [strings addObject:label];
-        }
+        BBAddNonEmptyString(strings, [(id<BBFindMyUIKitProxy>)cell accessibilityLabel]);
     }
-    if ([cell respondsToSelector:@selector(textLabel)]) {
-        id textLabel = [(id<BBFindMyUIKitProxy>)cell textLabel];
-        if ([textLabel respondsToSelector:@selector(text)]) {
-            NSString *text = [(id<BBFindMyUIKitProxy>)textLabel text];
-            if ([text isKindOfClass:[NSString class]] && text.length > 0) {
-                [strings addObject:text];
-            }
-        }
-    }
-    if ([cell respondsToSelector:@selector(detailTextLabel)]) {
-        id detailLabel = [(id<BBFindMyUIKitProxy>)cell detailTextLabel];
-        if ([detailLabel respondsToSelector:@selector(text)]) {
-            NSString *text = [(id<BBFindMyUIKitProxy>)detailLabel text];
-            if ([text isKindOfClass:[NSString class]] && text.length > 0) {
-                [strings addObject:text];
+    for (NSString *labelKey in @[@"textLabel", @"detailTextLabel"]) {
+        SEL sel = NSSelectorFromString(labelKey);
+        if ([cell respondsToSelector:sel]) {
+            id labelView = ((id (*)(id, SEL))objc_msgSend)(cell, sel);
+            if ([labelView respondsToSelector:@selector(text)]) {
+                BBAddNonEmptyString(strings, [(id<BBFindMyUIKitProxy>)labelView text]);
             }
         }
     }
@@ -949,16 +919,10 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
         id view = queue[idx++];
         if (view != cell) {
             if ([view respondsToSelector:@selector(accessibilityLabel)]) {
-                NSString *label = [(id<BBFindMyUIKitProxy>)view accessibilityLabel];
-                if ([label isKindOfClass:[NSString class]] && label.length > 0) {
-                    [strings addObject:label];
-                }
+                BBAddNonEmptyString(strings, [(id<BBFindMyUIKitProxy>)view accessibilityLabel]);
             }
             if ([view respondsToSelector:@selector(text)]) {
-                NSString *text = [(id<BBFindMyUIKitProxy>)view text];
-                if ([text isKindOfClass:[NSString class]] && text.length > 0) {
-                    [strings addObject:text];
-                }
+                BBAddNonEmptyString(strings, [(id<BBFindMyUIKitProxy>)view text]);
             }
         }
         if ([view respondsToSelector:@selector(subviews)]) {

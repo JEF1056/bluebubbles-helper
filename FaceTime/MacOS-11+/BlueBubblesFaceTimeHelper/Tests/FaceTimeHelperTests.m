@@ -92,13 +92,38 @@
 static NSMutableDictionary<NSString *, MockCall *> *gMockCalls;
 static NSMutableArray<MockCall *> *gDisconnectedCalls;
 static TUDialRequest *gLastDialRequest;
+static id gLastJoinRequest;
 static MockCall *gNextDialCall;
 static NSError *gNextDialError;
 static MockNetworkController *gMockSharedNetworkController;
+static id gMockGeneratedLink;
+static BOOL gDidInvalidateLink = NO;
+
+@interface MockConversationLink : NSObject
+@property (nonatomic, copy) NSURL *URL;
+@property (nonatomic, copy) NSUUID *groupUUID;
+@end
+@implementation MockConversationLink
+@end
 
 @implementation NetworkController (TestHook)
 + (NetworkController *)bb_test_sharedInstance {
     return gMockSharedNetworkController;
+}
+@end
+
+@implementation TUConversationManager (TestHook)
+- (void)bb_test_generateLinkWithInvitedMemberHandles:(NSSet *)handles linkLifetimeScope:(NSInteger)scope completionHandler:(void (^)(TUConversationLink *, NSError *))completion {
+    if (completion) {
+        completion(gMockGeneratedLink, gMockGeneratedLink ? nil : [NSError errorWithDomain:@"Test" code:1 userInfo:nil]);
+    }
+}
+- (void)bb_test_invalidateLink:(TUConversationLink *)link completionHandler:(void (^)(BOOL, NSError *))completion {
+    gDidInvalidateLink = YES;
+    if (completion) completion(YES, nil);
+}
+- (NSSet *)bb_test_activatedConversationLinks {
+    return gMockGeneratedLink ? [NSSet setWithObject:gMockGeneratedLink] : [NSSet set];
 }
 @end
 
@@ -111,11 +136,20 @@ static MockNetworkController *gMockSharedNetworkController;
         [gDisconnectedCalls addObject:(MockCall *)call];
     }
 }
+- (void)bb_test_disconnectCall:(TUCall *)call withReason:(int)reason {
+    if (call != nil) {
+        [gDisconnectedCalls addObject:(MockCall *)call];
+    }
+}
 - (void)bb_test_dialWithRequest:(id)request completionWithError:(void (^)(TUCall *, NSError *))completion {
     gLastDialRequest = (TUDialRequest *)request;
     if (completion) {
         completion((TUCall *)gNextDialCall, gNextDialError);
     }
+}
+- (TUCall *)bb_test_joinConversationWithConversationRequest:(id)request {
+    gLastJoinRequest = request;
+    return (TUCall *)gNextDialCall;
 }
 @end
 
@@ -293,6 +327,7 @@ static void TestSetMuted(BLUEBUBBLESFACETIMEHELPER *helper) {
 }
 
 static void TestGenerateLink(BLUEBUBBLESFACETIMEHELPER *helper) {
+    gMockGeneratedLink = nil;
     MockNetworkController *nc = [[MockNetworkController alloc] init];
     
     // 1. Generic link path when callUUID is null: uses async sharedConversationManager without spurious sync error
@@ -345,19 +380,25 @@ static void TestStartCall(BLUEBUBBLESFACETIMEHELPER *helper) {
     gNextDialCall = dialedFT;
     gNextDialError = nil;
     gLastDialRequest = nil;
+    gLastJoinRequest = nil;
+    MockConversationLink *mockLink = [[MockConversationLink alloc] init];
+    mockLink.URL = [NSURL URLWithString:@"https://facetime.apple.com/join#v=1&p=test"];
+    mockLink.groupUUID = [NSUUID UUID];
+    gMockGeneratedLink = mockLink;
 
     [helper handleMessage:nc message:JsonString(@{
         @"action": @"start-call",
         @"transactionId": @"tx-s1",
         @"data": @{@"addresses": @[@"+15551234567"], @"video": @YES, @"isTelephony": @NO}
     })];
-    AssertTrue(gLastDialRequest != nil, @"Expected TUDialRequest to be dispatched");
-    AssertTrue(gLastDialRequest.isValid == YES, @"Expected valid FaceTime TUDialRequest");
-    AssertTrue(gLastDialRequest.isVideo == YES, @"Expected video=YES on FaceTime request");
-    AssertTrue(gLastDialRequest.provider.isFaceTimeProvider == YES, @"Expected faceTimeProvider");
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    AssertTrue(gLastJoinRequest != nil, @"Expected TUJoinConversationRequest to be dispatched for FaceTime call");
+    AssertTrue([gLastJoinRequest valueForKey:@"conversationLink"] == mockLink, @"Expected conversationLink on FaceTime join request");
+    AssertTrue([[gLastJoinRequest valueForKey:@"isVideo"] isEqual:@YES], @"Expected video=YES on FaceTime join request");
     NSDictionary *reply1 = nc.sentMessages.lastObject;
     AssertTrue([reply1[@"call_uuid"] isEqualToString:@"dialed-ft-uuid"], @"Expected call_uuid in start-call reply");
     AssertTrue([reply1[@"is_video"] isEqual:@YES], @"Expected is_video=YES in start-call reply");
+    AssertTrue([reply1[@"url"] isKindOfClass:[NSString class]] && [reply1[@"url"] length] > 0, @"Expected pregenerated url in start-call reply");
 
     // 2. Telephony start-call (forces audio)
     MockProvider *telProv = [[MockProvider alloc] init];
@@ -398,6 +439,69 @@ static void TestStartCall(BLUEBUBBLESFACETIMEHELPER *helper) {
     printf("PASS: TestStartCall\n");
 }
 
+@interface DtmfMockCall : MockCall
+@property (nonatomic) BOOL supportsDTMFTones;
+@property (nonatomic, copy) NSString *lastPlayedDtmf;
+- (void)playDTMFToneForKey:(unsigned char)key;
+@end
+
+@implementation DtmfMockCall
+- (void)playDTMFToneForKey:(unsigned char)key {
+    self.lastPlayedDtmf = [NSString stringWithFormat:@"%c", key];
+}
+@end
+
+static void TestPlayDtmf(BLUEBUBBLESFACETIMEHELPER *helper) {
+    MockNetworkController *nc = [[MockNetworkController alloc] init];
+
+    // 1. Missing call -> error
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"play-dtmf",
+        @"transactionId": @"tx-d1",
+        @"data": @{@"callUUID": @"missing-call", @"digit": @"5"}
+    })];
+    AssertTrue(nc.sentMessages.lastObject[@"error"] != nil, @"Missing call must return error");
+
+    // 2. Invalid digit -> error
+    DtmfMockCall *call = [[DtmfMockCall alloc] init];
+    call.callUUID = @"dtmf-call";
+    call.callStatus = 1;
+    call.supportsDTMFTones = YES;
+    gMockCalls[@"dtmf-call"] = call;
+
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"play-dtmf",
+        @"transactionId": @"tx-d2",
+        @"data": @{@"callUUID": @"dtmf-call", @"digit": @"Z"}
+    })];
+    AssertTrue(nc.sentMessages.lastObject[@"error"] != nil, @"Invalid digit must return error");
+
+    // 3. Valid digit on call implementing playDTMFToneForKey: -> played: true
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"play-dtmf",
+        @"transactionId": @"tx-d3",
+        @"data": @{@"callUUID": @"dtmf-call", @"digit": @"#"}
+    })];
+    AssertTrue([nc.sentMessages.lastObject[@"played"] isEqual:@YES], @"Expected played:true when selector present");
+    AssertTrue([call.lastPlayedDtmf isEqualToString:@"#"], @"Expected # to be played");
+
+    // 4. Call without DTMF selector -> played: false, fallback: "bridge"
+    MockCall *plainCall = [[MockCall alloc] init];
+    plainCall.callUUID = @"plain-call";
+    plainCall.callStatus = 1;
+    gMockCalls[@"plain-call"] = plainCall;
+
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"play-dtmf",
+        @"transactionId": @"tx-d4",
+        @"data": @{@"callUUID": @"plain-call", @"digit": @"7"}
+    })];
+    AssertTrue([nc.sentMessages.lastObject[@"played"] isEqual:@NO], @"Expected played:false when selector absent");
+    AssertTrue([nc.sentMessages.lastObject[@"fallback"] isEqualToString:@"bridge"], @"Expected bridge fallback");
+
+    printf("PASS: TestPlayDtmf\n");
+}
+
 int main(void) {
     @autoreleasepool {
         gMockCalls = [NSMutableDictionary dictionary];
@@ -407,7 +511,12 @@ int main(void) {
         SwizzleSelector([NetworkController class], @selector(sharedInstance), @selector(bb_test_sharedInstance), YES);
         SwizzleSelector([TUCallCenter class], @selector(callWithCallUUID:), @selector(bb_test_callWithCallUUID:), NO);
         SwizzleSelector([TUCallCenter class], @selector(disconnectCall:), @selector(bb_test_disconnectCall:), NO);
+        SwizzleSelector([TUCallCenter class], @selector(disconnectCall:withReason:), @selector(bb_test_disconnectCall:withReason:), NO);
         SwizzleSelector([TUCallCenter class], @selector(dialWithRequest:completionWithError:), @selector(bb_test_dialWithRequest:completionWithError:), NO);
+        SwizzleSelector([TUCallCenter class], @selector(joinConversationWithConversationRequest:), @selector(bb_test_joinConversationWithConversationRequest:), NO);
+        SwizzleSelector([TUConversationManager class], @selector(generateLinkWithInvitedMemberHandles:linkLifetimeScope:completionHandler:), @selector(bb_test_generateLinkWithInvitedMemberHandles:linkLifetimeScope:completionHandler:), NO);
+        SwizzleSelector([TUConversationManager class], @selector(invalidateLink:completionHandler:), @selector(bb_test_invalidateLink:completionHandler:), NO);
+        SwizzleSelector([TUConversationManager class], @selector(activatedConversationLinks), @selector(bb_test_activatedConversationLinks), NO);
 
         BLUEBUBBLESFACETIMEHELPER *helper = [BLUEBUBBLESFACETIMEHELPER sharedInstance];
         TestCallStatusMetadataSerialization(helper);
@@ -415,6 +524,30 @@ int main(void) {
         TestSetMuted(helper);
         TestStartCall(helper);
         TestGenerateLink(helper);
+        TestPlayDtmf(helper);
+
+        // Test end-and-invalidate-call
+        MockConversationLink *endLink = [[MockConversationLink alloc] init];
+        endLink.URL = [NSURL URLWithString:@"https://facetime.apple.com/join#v=1&p=endtest"];
+        endLink.groupUUID = [NSUUID UUID];
+        gMockGeneratedLink = endLink;
+
+        MockCall *endCall = [[MockCall alloc] init];
+        endCall.callUUID = @"end-inv-uuid";
+        endCall.callStatus = 1;
+        gMockCalls[@"end-inv-uuid"] = endCall;
+        gDidInvalidateLink = NO;
+        [gDisconnectedCalls removeAllObjects];
+        [helper handleMessage:gMockSharedNetworkController message:JsonString(@{
+            @"action": @"end-and-invalidate-call",
+            @"transactionId": @"tx-e1",
+            @"data": @{@"callUUID": @"end-inv-uuid", @"url": [endLink.URL absoluteString]}
+        })];
+        [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        AssertTrue([gDisconnectedCalls containsObject:endCall], @"Expected end-and-invalidate-call to disconnect call");
+        AssertTrue(gDidInvalidateLink == YES, @"Expected end-and-invalidate-call to invalidate link");
+        AssertTrue([gMockSharedNetworkController.sentMessages.lastObject[@"ended"] isEqual:@YES], @"Expected ended:true reply");
+        printf("PASS: TestEndAndInvalidateCall\n");
         printf("ALL FACETIME HELPER TESTS PASSED\n");
     }
     return 0;
