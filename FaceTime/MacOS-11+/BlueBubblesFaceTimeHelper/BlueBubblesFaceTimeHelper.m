@@ -19,11 +19,78 @@
 #import "TUCall.h"
 #import "TUHandle.h"
 
+static NSString *BBNonEmptyString(id value) {
+    return ([value isKindOfClass:[NSString class]] && [(NSString *)value length] > 0) ? (NSString *)value : nil;
+}
+
 static NSString *BBExtractCallUUID(NSDictionary *data) {
     if (![data isKindOfClass:[NSDictionary class]]) return nil;
-    id val = data[@"callUUID"];
-    if (![val isKindOfClass:[NSString class]]) val = data[@"call_uuid"];
-    return ([val isKindOfClass:[NSString class]] && [(NSString *)val length] > 0) ? val : nil;
+    NSString *val = BBNonEmptyString(data[@"callUUID"]);
+    if (val == nil) val = BBNonEmptyString(data[@"call_uuid"]);
+    if (val == nil) val = BBNonEmptyString(data[@"uniqueProxyIdentifier"]);
+    if (val == nil) val = BBNonEmptyString(data[@"unique_proxy_identifier"]);
+    return val;
+}
+
+static NSString *BBCallUniqueProxyIdentifier(TUCall *call) {
+    if (call == nil) return nil;
+    if ([call respondsToSelector:@selector(uniqueProxyIdentifier)]) {
+        NSString *upi = BBNonEmptyString([call uniqueProxyIdentifier]);
+        if (upi != nil) return upi;
+    }
+    if ([call respondsToSelector:@selector(uniqueProxyIdentifierUUID)]) {
+        NSUUID *uuid = [call uniqueProxyIdentifierUUID];
+        if ([uuid isKindOfClass:[NSUUID class]]) {
+            NSString *s = BBNonEmptyString([uuid UUIDString]);
+            if (s != nil) return s;
+        }
+    }
+    return nil;
+}
+
+// macOS 26.4+ TUProxyCall leaves _callUUID nil until callservicesd sends updateWithCall:,
+// while uniqueProxyIdentifier is populated immediately at dial/join creation.
+static NSString *BBResolvedCallUUID(TUCall *call) {
+    if (call == nil) return nil;
+    if ([call respondsToSelector:@selector(callUUID)]) {
+        NSString *uuid = BBNonEmptyString([call callUUID]);
+        if (uuid != nil) return uuid;
+    }
+    NSString *upi = BBCallUniqueProxyIdentifier(call);
+    if (upi != nil) return upi;
+    if ([call respondsToSelector:@selector(callGroupUUID)]) {
+        NSUUID *groupUUID = [call callGroupUUID];
+        if ([groupUUID isKindOfClass:[NSUUID class]]) {
+            NSString *s = BBNonEmptyString([groupUUID UUIDString]);
+            if (s != nil) return s;
+        }
+    }
+    return nil;
+}
+
+static TUCall *BBFindCallByIdentifier(TUCallCenter *callCenter, NSString *identifier) {
+    NSString *target = BBNonEmptyString(identifier);
+    if (callCenter == nil || target == nil) return nil;
+    TUCall *call = [callCenter callWithCallUUID:target];
+    if (call != nil) return call;
+    if ([callCenter respondsToSelector:@selector(callWithUniqueProxyIdentifier:)]) {
+        call = [callCenter callWithUniqueProxyIdentifier:target];
+        if (call != nil) return call;
+    }
+    NSArray<TUCall *> *lists[2] = {
+        [callCenter respondsToSelector:@selector(currentCalls)] ? [callCenter currentCalls] : nil,
+        [callCenter respondsToSelector:@selector(incomingCalls)] ? [callCenter incomingCalls] : nil,
+    };
+    for (int i = 0; i < 2; i++) {
+        for (TUCall *candidate in lists[i]) {
+            NSString *candidateUUID = [candidate respondsToSelector:@selector(callUUID)] ? BBNonEmptyString([candidate callUUID]) : nil;
+            if ([candidateUUID isEqualToString:target] ||
+                [BBCallUniqueProxyIdentifier(candidate) isEqualToString:target]) {
+                return candidate;
+            }
+        }
+    }
+    return nil;
 }
 
 static void BBSendReply(NetworkController *controller, NSString *transaction, NSDictionary *extra) {
@@ -200,8 +267,8 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
     if ([self handleForkMessage:replyController event:event data:data transaction:transaction]) return;
 
     if ([event isEqualToString:@"answer-call"]) {
-        NSString *callUUID = [data[@"callUUID"] isKindOfClass:[NSString class]] ? data[@"callUUID"] : nil;
-        TUCall *call = callUUID != nil ? [[TUCallCenter sharedInstance] callWithCallUUID:callUUID] : nil;
+        NSString *callUUID = BBExtractCallUUID(data);
+        TUCall *call = BBFindCallByIdentifier([TUCallCenter sharedInstance], callUUID);
         
         if ([call callStatus] != 4) {
             if (transaction != nil) {
@@ -216,7 +283,7 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         }
     } else if ([event isEqualToString:@"leave-call"] || [event isEqualToString:@"decline-call"]) {
         NSString *callUUID = BBExtractCallUUID(data);
-        TUCall *call = callUUID != nil ? [[TUCallCenter sharedInstance] callWithCallUUID:callUUID] : nil;
+        TUCall *call = BBFindCallByIdentifier([TUCallCenter sharedInstance], callUUID);
         int status = call != nil ? [call callStatus] : 0;
 
         if (call == nil || (status != 1 && status != 3 && status != 4)) {

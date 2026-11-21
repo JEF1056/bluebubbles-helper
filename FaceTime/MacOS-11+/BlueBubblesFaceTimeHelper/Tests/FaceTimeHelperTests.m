@@ -52,6 +52,8 @@
 @property (nonatomic, copy) NSString *audioMode;
 @property (nonatomic) int callStatus;
 @property (nonatomic, copy) NSString *callUUID;
+@property (nonatomic, copy) NSString *uniqueProxyIdentifier;
+@property (nonatomic, strong) NSUUID *callGroupUUID;
 @property (nonatomic, getter=isConversation) BOOL conversation;
 @property (nonatomic) int disconnectedReason;
 @property (nonatomic, copy) NSString *endedErrorString;
@@ -129,7 +131,19 @@ static BOOL gDidInvalidateLink = NO;
 
 @implementation TUCallCenter (TestHook)
 - (TUCall *)bb_test_callWithCallUUID:(NSString *)uuid {
-    return (TUCall *)gMockCalls[uuid];
+    MockCall *call = gMockCalls[uuid];
+    return (call != nil && [call.callUUID isEqualToString:uuid]) ? (TUCall *)call : nil;
+}
+- (TUCall *)bb_test_callWithUniqueProxyIdentifier:(NSString *)upi {
+    for (MockCall *call in [gMockCalls allValues]) {
+        if ([call.uniqueProxyIdentifier isEqualToString:upi]) {
+            return (TUCall *)call;
+        }
+    }
+    return nil;
+}
+- (NSArray<TUCall *> *)bb_test_currentCalls {
+    return (NSArray<TUCall *> *)[gMockCalls allValues];
 }
 - (void)bb_test_disconnectCall:(TUCall *)call {
     if (call != nil) {
@@ -565,6 +579,80 @@ static void TestNetworkControllerFramingAndTypeGuards(BLUEBUBBLESFACETIMEHELPER 
     printf("PASS: TestNetworkControllerFramingAndTypeGuards\n");
 }
 
+static void TestTUProxyCallNilCallUUIDFallback(BLUEBUBBLESFACETIMEHELPER *helper) {
+    // macOS 26.4 TUProxyCall leaves callUUID nil at dial/join creation and populates
+    // uniqueProxyIdentifier immediately until callservicesd sends updateWithCall:.
+    MockCall *call = [[MockCall alloc] init];
+    call.callUUID = nil;
+    call.uniqueProxyIdentifier = @"UPI-MACOS26-1111";
+    call.callStatus = 3; // outgoing / dialing
+    call.outgoing = YES;
+    gNextDialCall = call;
+    gNextDialError = nil;
+    gMockGeneratedLink = nil;
+    [gMockCalls removeAllObjects];
+    gMockCalls[@"slot-1"] = call;
+
+    MockNetworkController *nc = [[MockNetworkController alloc] init];
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"start-call",
+        @"transactionId": @"tx-nil-uuid-dial",
+        @"data": @{
+            @"addresses": @[@"+16266165776"],
+            @"isVideo": @NO
+        }
+    })];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+
+    AssertTrue(nc.sentMessages.count == 1, @"start-call with nil callUUID should still reply");
+    NSDictionary *reply = nc.sentMessages.firstObject;
+    AssertTrue([reply[@"call_uuid"] isEqualToString:@"UPI-MACOS26-1111"],
+               @"start-call should fall back to uniqueProxyIdentifier when callUUID is nil");
+    AssertTrue([reply[@"unique_proxy_identifier"] isEqualToString:@"UPI-MACOS26-1111"],
+               @"start-call should include unique_proxy_identifier");
+
+    // Verify status update payload before callUUID is populated
+    NSDictionary *prePayload = [helper callStatusPayloadForCall:(TUCall *)call];
+    AssertTrue([prePayload[@"call_uuid"] isEqualToString:@"UPI-MACOS26-1111"],
+               @"status payload should fall back to uniqueProxyIdentifier while callUUID is nil");
+    AssertTrue([prePayload[@"unique_proxy_identifier"] isEqualToString:@"UPI-MACOS26-1111"],
+               @"status payload should carry unique_proxy_identifier");
+
+    // Simulate callservicesd assigning real callUUID later while client still references UPI
+    call.callUUID = @"REAL-CALL-UUID-2222";
+    call.callStatus = 1; // active
+    NSDictionary *postPayload = [helper callStatusPayloadForCall:(TUCall *)call];
+    AssertTrue([postPayload[@"call_uuid"] isEqualToString:@"REAL-CALL-UUID-2222"],
+               @"status payload should report real callUUID once populated");
+    AssertTrue([postPayload[@"unique_proxy_identifier"] isEqualToString:@"UPI-MACOS26-1111"],
+               @"status payload should continue reporting unique_proxy_identifier for server aliasing");
+
+    // Client sends set-muted and leave-call using the initial UPI identifier
+    MockNetworkController *muteNc = [[MockNetworkController alloc] init];
+    [helper handleMessage:muteNc message:JsonString(@{
+        @"action": @"set-muted",
+        @"transactionId": @"tx-mute-by-upi",
+        @"data": @{@"callUUID": @"UPI-MACOS26-1111", @"muted": @YES}
+    })];
+    AssertTrue(call.isUplinkMuted == YES, @"set-muted by uniqueProxyIdentifier should find call even after callUUID changes");
+    AssertTrue([muteNc.sentMessages.lastObject[@"muted"] isEqual:@YES],
+               @"set-muted reply should confirm muted state");
+
+    [gDisconnectedCalls removeAllObjects];
+    MockNetworkController *leaveNc = [[MockNetworkController alloc] init];
+    [helper handleMessage:leaveNc message:JsonString(@{
+        @"action": @"leave-call",
+        @"transactionId": @"tx-leave-by-upi",
+        @"data": @{@"callUUID": @"UPI-MACOS26-1111"}
+    })];
+    AssertTrue(gDisconnectedCalls.count == 1 && gDisconnectedCalls.firstObject == call,
+               @"leave-call by uniqueProxyIdentifier should disconnect call");
+
+    gNextDialCall = nil;
+    [gMockCalls removeAllObjects];
+    printf("PASS: TestTUProxyCallNilCallUUIDFallback\n");
+}
+
 int main(void) {
     @autoreleasepool {
         gMockCalls = [NSMutableDictionary dictionary];
@@ -573,6 +661,8 @@ int main(void) {
 
         SwizzleSelector([NetworkController class], @selector(sharedInstance), @selector(bb_test_sharedInstance), YES);
         SwizzleSelector([TUCallCenter class], @selector(callWithCallUUID:), @selector(bb_test_callWithCallUUID:), NO);
+        SwizzleSelector([TUCallCenter class], @selector(callWithUniqueProxyIdentifier:), @selector(bb_test_callWithUniqueProxyIdentifier:), NO);
+        SwizzleSelector([TUCallCenter class], @selector(currentCalls), @selector(bb_test_currentCalls), NO);
         SwizzleSelector([TUCallCenter class], @selector(disconnectCall:), @selector(bb_test_disconnectCall:), NO);
         SwizzleSelector([TUCallCenter class], @selector(disconnectCall:withReason:), @selector(bb_test_disconnectCall:withReason:), NO);
         SwizzleSelector([TUCallCenter class], @selector(dialWithRequest:completionWithError:), @selector(bb_test_dialWithRequest:completionWithError:), NO);
@@ -589,6 +679,7 @@ int main(void) {
         TestGenerateLink(helper);
         TestPlayDtmf(helper);
         TestNetworkControllerFramingAndTypeGuards(helper);
+        TestTUProxyCallNilCallUUIDFallback(helper);
 
         // Test end-and-invalidate-call
         MockConversationLink *endLink = [[MockConversationLink alloc] init];

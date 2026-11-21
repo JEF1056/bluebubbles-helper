@@ -104,7 +104,7 @@
                     transaction:(NSString *)transaction
                 replyController:(NetworkController *)replyController {
     TUCallCenter *callCenter = [TUCallCenter sharedInstance];
-    TUCall *call = [callCenter callWithCallUUID:callUUID];
+    TUCall *call = BBFindCallByIdentifier(callCenter, callUUID);
     if (call == nil || [call callStatus] == 6) {
         BBSendReply(replyController, transaction, @{@"error": @"Call is no longer active!"});
         return;
@@ -211,10 +211,13 @@
     BOOL convHasJoined = [convo respondsToSelector:@selector(hasJoined)] ? [convo hasJoined] : NO;
     BOOL isOneToOneMode = [convo respondsToSelector:@selector(isOneToOneModeEnabled)] ? [convo isOneToOneModeEnabled] : NO;
 
+    NSString *resolvedCallUUID = BBResolvedCallUUID(call);
+    NSString *uniqueProxyIdentifier = BBCallUniqueProxyIdentifier(call);
     return @{
         @"audio_mode": [call audioMode] ?: [NSNull null],
         @"call_status": @([call callStatus]),
-        @"call_uuid": [call callUUID] ?: [NSNull null],
+        @"call_uuid": resolvedCallUUID ?: [NSNull null],
+        @"unique_proxy_identifier": uniqueProxyIdentifier ?: [NSNull null],
         @"is_conversation": @([call isConversation]),
         @"disconnected_reason": @([call disconnectedReason]),
         @"ended_error": [call endedErrorString] ?: [NSNull null],
@@ -293,7 +296,7 @@
 - (BOOL)handleForkMessage:(NetworkController *)replyController event:(NSString *)event data:(NSDictionary *)data transaction:(NSString *)transaction {
     if ([event isEqualToString:@"set-muted"]) {
         NSString *callUUID = BBExtractCallUUID(data);
-        TUCall *call = callUUID != nil ? [[TUCallCenter sharedInstance] callWithCallUUID:callUUID] : nil;
+        TUCall *call = BBFindCallByIdentifier([TUCallCenter sharedInstance], callUUID);
         if (call == nil) {
             BBSendReply(replyController, transaction, @{@"error": @"Call not found!"});
             return YES;
@@ -347,7 +350,7 @@
         return YES;
     } else if ([event isEqualToString:@"play-dtmf"]) {
         NSString *callUUID = BBExtractCallUUID(data);
-        TUCall *call = callUUID != nil ? [[TUCallCenter sharedInstance] callWithCallUUID:callUUID] : nil;
+        TUCall *call = BBFindCallByIdentifier([TUCallCenter sharedInstance], callUUID);
         if (call == nil) {
             BBSendReply(replyController, transaction, @{@"error": @"Call not found!"});
             return YES;
@@ -472,7 +475,17 @@
                     return;
                 }
                 NSMutableDictionary *response = [([self callStatusPayloadForCall:call] ?: @{}) mutableCopy];
-                response[@"call_uuid"] = [call callUUID] ?: [NSNull null];
+                NSString *resolvedCallUUID = BBResolvedCallUUID(call);
+                NSString *uniqueProxyIdentifier = BBCallUniqueProxyIdentifier(call);
+                if ([request respondsToSelector:@selector(uniqueProxyIdentifier)]) {
+                    NSString *reqUPI = BBNonEmptyString([(id)request uniqueProxyIdentifier]);
+                    if (resolvedCallUUID == nil) resolvedCallUUID = reqUPI;
+                    if (uniqueProxyIdentifier == nil) uniqueProxyIdentifier = reqUPI;
+                }
+                response[@"call_uuid"] = resolvedCallUUID ?: [NSNull null];
+                if (uniqueProxyIdentifier != nil) {
+                    response[@"unique_proxy_identifier"] = uniqueProxyIdentifier;
+                }
                 if ([pregeneratedUrl length] > 0) {
                     response[@"url"] = pregeneratedUrl;
                 }
@@ -531,11 +544,19 @@
                             joinReq.showUIPrompt = NO;
                             TUCall *call = [callCenter joinConversationWithConversationRequest:joinReq];
                             if (call != nil) {
+                                NSString *resolvedCallUUID = BBResolvedCallUUID(call);
+                                NSString *uniqueProxyIdentifier = BBCallUniqueProxyIdentifier(call);
+                                if ([joinReq respondsToSelector:NSSelectorFromString(@"uniqueProxyIdentifierUUID")]) {
+                                    id reqUUID = [joinReq valueForKey:@"uniqueProxyIdentifierUUID"];
+                                    NSString *reqUPI = [reqUUID isKindOfClass:[NSUUID class]] ? BBNonEmptyString([(NSUUID *)reqUUID UUIDString]) : nil;
+                                    if (resolvedCallUUID == nil) resolvedCallUUID = reqUPI;
+                                    if (uniqueProxyIdentifier == nil) uniqueProxyIdentifier = reqUPI;
+                                }
                                 // Ensure invited remote members are buzzed/rung on link-backed GFT conversations.
                                 if ([manager respondsToSelector:@selector(buzzMember:conversation:)] && [members count] > 0) {
-                                    NSString *joinedCallUUID = [[call callUUID] copy];
+                                    NSString *joinedCallUUID = [resolvedCallUUID copy];
                                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-                                        TUCall *liveCall = joinedCallUUID != nil ? [callCenter callWithCallUUID:joinedCallUUID] : nil;
+                                        TUCall *liveCall = BBFindCallByIdentifier(callCenter, joinedCallUUID);
                                         TUConversation *convo = liveCall != nil && [callCenter respondsToSelector:@selector(activeConversationForCall:)]
                                             ? [callCenter activeConversationForCall:liveCall]
                                             : nil;
@@ -546,9 +567,12 @@
                                         }
                                     });
                                 }
-                                DLog("BLUEBUBBLESFACETIMEHELPER: started link-backed GFT call %{public}@ with link %{public}@", [call callUUID], linkUrl);
+                                DLog("BLUEBUBBLESFACETIMEHELPER: started link-backed GFT call %{public}@ with link %{public}@", resolvedCallUUID, linkUrl);
                                 NSMutableDictionary *response = [([self callStatusPayloadForCall:call] ?: @{}) mutableCopy];
-                                response[@"call_uuid"] = [call callUUID] ?: [NSNull null];
+                                response[@"call_uuid"] = resolvedCallUUID ?: [NSNull null];
+                                if (uniqueProxyIdentifier != nil) {
+                                    response[@"unique_proxy_identifier"] = uniqueProxyIdentifier;
+                                }
                                 response[@"url"] = linkUrl;
                                 BBSendReply(replyController, transaction, response);
                                 return;
@@ -574,7 +598,7 @@
 
         TUCallCenter *callCenter = [TUCallCenter sharedInstance];
         TUConversationManager *manager = [self sharedConversationManager];
-        TUCall *call = callUUID != nil ? [callCenter callWithCallUUID:callUUID] : nil;
+        TUCall *call = BBFindCallByIdentifier(callCenter, callUUID);
 
         if (call == nil && [targetConvUUID length] > 0 && [callCenter respondsToSelector:@selector(callForConversationWithGroupUUID:)]) {
             NSUUID *groupNSUUID = [[NSUUID alloc] initWithUUIDString:targetConvUUID];
