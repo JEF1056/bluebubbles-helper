@@ -796,6 +796,40 @@ int main(void) {
             return BBStartUpdatingFriendsCount == startFriendsBefore + 1 && BBRecordedStarts.count >= 1;
         }, 0.5), @"reconnect must restart friend updates and friend streaming");
 
+        // 8. Stop live location while connected & streaming restores passive shallow refresh (priority 1)
+        [BBRecordedStarts removeAllObjects];
+        [BBRecordedStops removeAllObjects];
+        [socket.sentMessages removeAllObjects];
+        [helper handleServerAction:@"start-findmy-live-location"
+                              data:@{@"handle": @"alice@example.com"}
+             transactionIdentifier:@"tx-restore-shallow-start"];
+        BBAssert(BBWaitUntil(^BOOL { return BBRecordedStarts.count >= 1 && socket.sentMessages.count >= 1; }, 0.5),
+                 @"live start before stop must complete");
+        [BBRecordedStarts removeAllObjects];
+        [BBRecordedStops removeAllObjects];
+        [socket.sentMessages removeAllObjects];
+        [helper handleServerAction:@"stop-findmy-live-location"
+                              data:@{@"handle": @"alice@example.com"}
+             transactionIdentifier:@"tx-restore-shallow-stop"];
+        BBAssert(BBWaitUntil(^BOOL {
+            return BBRecordedStops.count >= 1 && BBRecordedStarts.count >= 1 && socket.sentMessages.count >= 1;
+        }, 0.5), @"stopping live location while streaming must restore passive shallow refresh");
+        BBAssert([BBRecordedStops.firstObject[@"priority"] isEqual:@2] &&
+                 [BBRecordedStarts.firstObject[@"handles"] isEqual:@[@"alice@example.com"]] &&
+                 [BBRecordedStarts.firstObject[@"priority"] isEqual:@1],
+                 @"restored passive refresh must target alice at shallow priority 1");
+
+        // 9. Disconnect while async friend streaming is in flight must not start streaming while disconnected
+        [helper handleServerDisconnected];
+        [BBRecordedStarts removeAllObjects];
+        BBUseAsyncDelayedFriendResolution = YES;
+        [helper handleServerRegistered];
+        [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+        [helper handleServerDisconnected];
+        BBAssert(!BBWaitUntil(^BOOL { return BBRecordedStarts.count > 0; }, 0.08),
+                 @"async friend streaming callback after disconnect must not start location refreshes");
+        BBUseAsyncDelayedFriendResolution = NO;
+
         NSLog(@"PASS: FindMyHelperLiveTests");
     }
     return 0;

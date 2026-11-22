@@ -11,6 +11,7 @@
 #import <sys/mman.h>
 #import <sys/stat.h>
 #import <unistd.h>
+#import <dispatch/dispatch.h>
 
 extern CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSampleBuffer, const char *ringPath);
 
@@ -157,6 +158,18 @@ int main(void) {
     CMSampleBufferRef remapped = BBCameraHookCreateSwappedSampleBuffer(orig, path);
     assert(remapped != NULL);
     CFRelease(remapped);
+
+    // 10. Concurrent frame swap + GPU resource teardown (ts_ns = 0) must not race/crash
+    dispatch_group_t grp = dispatch_group_create();
+    dispatch_queue_t q1 = dispatch_queue_create("bb.test.swap", DISPATCH_QUEUE_CONCURRENT);
+    for (int i = 0; i < 40; i++) {
+        dispatch_group_async(grp, q1, ^{
+            hdr->ts_ns = (i % 3 == 0) ? 0 : now_ns();
+            CMSampleBufferRef sb = BBCameraHookCreateSwappedSampleBuffer(orig, path);
+            if (sb) CFRelease(sb);
+        });
+    }
+    dispatch_group_wait(grp, DISPATCH_TIME_FOREVER);
 
     CFRelease(orig);
     munmap(map, totalSize);

@@ -37,6 +37,7 @@ static const long long BBLiveLocationRefreshPriority = 2;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *inFlightRefreshHandleCounts;
 @property(nonatomic) BOOL friendStreamingStarted;
 @property(nonatomic) BOOL friendUpdatesActive;
+@property(nonatomic) BOOL serverConnected;
 @property(nonatomic) NSUInteger connectionGeneration;
 @property(nonatomic) NSUInteger activeForcedDeviceRefreshCount;
 @property(nonatomic, copy, nullable) NSString *activeLiveNormalizedIdentifier;
@@ -178,6 +179,9 @@ static os_log_t helperLog;
         return;
     }
     if (![session respondsToSelector:@selector(startUpdatingFriendsWithInitialUpdates:completion:)]) {
+        if (!self.friendStreamingStarted) {
+            [self startStreamingLocationsForAllFriends:session focusedHandle:nil];
+        }
         return;
     }
     self.friendUpdatesActive = YES;
@@ -187,12 +191,11 @@ static os_log_t helperLog;
         dispatch_async(dispatch_get_main_queue(), ^{
             FindMyHelper *strongSelf = weakSelf;
             if (strongSelf == nil ||
+                !strongSelf.serverConnected ||
                 strongSelf.connectionGeneration != generation ||
-                strongSelf.activeLocateSession != session ||
-                strongSelf.friendStreamingStarted) {
+                strongSelf.activeLocateSession != session) {
                 return;
             }
-            strongSelf.friendStreamingStarted = YES;
             [strongSelf startStreamingLocationsForAllFriends:session focusedHandle:nil];
         });
     }];
@@ -200,27 +203,32 @@ static os_log_t helperLog;
 
 - (void)handleServerRegistered {
     dispatch_async(dispatch_get_main_queue(), ^{
+        self.serverConnected = YES;
         self.connectionGeneration += 1;
         NSUInteger generation = self.connectionGeneration;
+        BOOL hadSession = (self.activeLocateSession != nil);
         FindMyLocateSession *session = [self locateSession];
         if (session == nil) {
             return;
         }
-        [self startFriendUpdatesForSession:session generation:generation];
-        if (self.friendStreamingStarted) {
+        if (!self.friendUpdatesActive) {
+            [self startFriendUpdatesForSession:session generation:generation];
             return;
         }
-        self.friendStreamingStarted = YES;
-        [self startStreamingLocationsForAllFriends:session focusedHandle:nil];
+        // Only start streaming immediately if a prior session already finished friend updates.
+        if (hadSession && !self.friendStreamingStarted) {
+            [self startStreamingLocationsForAllFriends:session focusedHandle:nil];
+        }
     });
 }
 
 - (void)handleServerDisconnected {
     void (^cleanup)(void) = ^{
+        self.serverConnected = NO;
         self.connectionGeneration += 1;
-        [self stopLiveLocationSession];
         self.friendStreamingStarted = NO;
         self.friendUpdatesActive = NO;
+        [self stopLiveLocationSession];
         FindMyLocateSession *session = self.activeLocateSession;
         if (session != nil) {
             NSArray *cachedFriends = nil;
@@ -362,10 +370,22 @@ static os_log_t helperLog;
 
 - (void)startStreamingLocationsForAllFriends:(FindMyLocateSession *)session
                                focusedHandle:(nullable NSString *)focusedHandle {
+    if (!self.serverConnected) {
+        return;
+    }
+    NSUInteger generation = self.connectionGeneration;
     NSString *trimmedFocus = [focusedHandle stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSString *normalizedFocus = trimmedFocus.length > 0 ? trimmedFocus : self.activeLiveNormalizedIdentifier;
 
+    __weak typeof(self) weakSelf = self;
     void (^refreshHandles)(NSArray * _Nullable) = ^(NSArray * _Nullable friendRecords) {
+        FindMyHelper *strongSelf = weakSelf;
+        if (strongSelf == nil ||
+            !strongSelf.serverConnected ||
+            strongSelf.connectionGeneration != generation ||
+            strongSelf.activeLocateSession != session) {
+            return;
+        }
         if (![friendRecords isKindOfClass:[NSArray class]] || friendRecords.count == 0) {
             return;
         }
@@ -381,6 +401,9 @@ static os_log_t helperLog;
                     [remainingHandles addObject:handle];
                 }
             }
+        }
+        if (focusedHandles.count > 0 || remainingHandles.count > 0) {
+            strongSelf.friendStreamingStarted = YES;
         }
         [FindMyFriendPayload startRefreshingSession:session handles:focusedHandles priority:BBLiveLocationRefreshPriority completion:nil];
         [FindMyFriendPayload startRefreshingSession:session handles:remainingHandles priority:BBShallowLocationRefreshPriority completion:nil];
@@ -457,6 +480,12 @@ static os_log_t helperLog;
             os_log(helperLog, "Stopped Find My live refresh for %{public}@", normalizedIdentifier ?: @"handle");
         }];
     }
+    if (self.serverConnected && self.friendStreamingStarted && session == self.activeLocateSession) {
+        [FindMyFriendPayload startRefreshingSession:session
+                                            handles:@[handleObject]
+                                           priority:BBShallowLocationRefreshPriority
+                                         completion:nil];
+    }
 }
 
 - (NSArray<NSString *> *)focusTargetsFromData:(nullable NSDictionary *)data {
@@ -495,13 +524,13 @@ static os_log_t helperLog;
     NSArray<NSString *> *focusTargets = [self focusTargetsFromData:data];
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:focusTargets];
-
         FindMyLocateSession *session = [self locateSession];
         if (session == nil) {
             [self sendError:@"FindMyLocateSession is unavailable" transactionIdentifier:transactionIdentifier];
             return;
         }
+
+        [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:focusTargets];
 
         self.liveSessionGeneration += 1;
         NSUInteger sessionGen = self.liveSessionGeneration;
@@ -674,6 +703,7 @@ static os_log_t helperLog;
         NSString *normalizedFocusKey = focusedHandle.lowercaseString;
         [self adjustInFlightRefreshCountForIdentifier:normalizedFocusKey delta:1];
 
+        NSUInteger generation = self.connectionGeneration;
         __weak typeof(self) weakSelf = self;
         __block __weak FindMyFriendsRefreshCoordinator *weakCoordinator = nil;
         FindMyFriendsRefreshCoordinator *coordinator = [[FindMyFriendsRefreshCoordinator alloc]
@@ -693,8 +723,9 @@ static os_log_t helperLog;
                             [strongSelf.activeFriendRefreshes removeObject:weakCoordinator];
                         }
                         [strongSelf restoreFocusConditionsIfIdle];
-                        if (!strongSelf.friendStreamingStarted) {
-                            strongSelf.friendStreamingStarted = YES;
+                        if (strongSelf.serverConnected &&
+                            strongSelf.connectionGeneration == generation &&
+                            !strongSelf.friendStreamingStarted) {
                             [strongSelf startStreamingLocationsForAllFriends:session focusedHandle:nil];
                         }
                     }

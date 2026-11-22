@@ -299,11 +299,8 @@ CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSa
         return NULL;
     }
 
-    VTPixelTransferSessionRef xfer = (VTPixelTransferSessionRef)CFRetain(g_reader.transfer_session);
+    OSStatus xferStatus = VTPixelTransferSessionTransferImage(g_reader.transfer_session, srcBuf, dstBuf);
     os_unfair_lock_unlock(&g_reader_lock);
-
-    OSStatus xferStatus = VTPixelTransferSessionTransferImage(xfer, srcBuf, dstBuf);
-    CFRelease(xfer);
     CFRelease(srcBuf);
 
     if (xferStatus != noErr) {
@@ -396,6 +393,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
 static const void *kBBProxyAssocKey = &kBBProxyAssocKey;
 static IMP g_origSetSampleBufferDelegate = NULL;
+static NSHashTable<AVCaptureVideoDataOutput *> *g_activeOutputs = nil;
 
 static void bb_swizzled_setSampleBufferDelegate(
     AVCaptureVideoDataOutput *self,
@@ -414,11 +412,27 @@ static void bb_swizzled_setSampleBufferDelegate(
 
     if (newProxy) {
         objc_setAssociatedObject(self, kBBProxyAssocKey, newProxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        @synchronized ([BBProxyDelegate class]) {
+            if (!g_activeOutputs) {
+                g_activeOutputs = [NSHashTable weakObjectsHashTable];
+            }
+            [g_activeOutputs addObject:self];
+        }
     } else if (!delegate) {
+        BOOL hadProxy = (objc_getAssociatedObject(self, kBBProxyAssocKey) != nil);
         objc_setAssociatedObject(self, kBBProxyAssocKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        os_unfair_lock_lock(&g_reader_lock);
-        bb_close_ring(&g_reader);
-        os_unfair_lock_unlock(&g_reader_lock);
+        if (hadProxy) {
+            BOOL shouldClose = NO;
+            @synchronized ([BBProxyDelegate class]) {
+                [g_activeOutputs removeObject:self];
+                shouldClose = ([g_activeOutputs allObjects].count == 0);
+            }
+            if (shouldClose) {
+                os_unfair_lock_lock(&g_reader_lock);
+                bb_close_ring(&g_reader);
+                os_unfair_lock_unlock(&g_reader_lock);
+            }
+        }
     }
 }
 
