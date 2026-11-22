@@ -629,7 +629,7 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
 
 @implementation BlueBubblesHelper (Stickers)
 
-+ (NSDictionary *)normalizedStickerUserInfo:(NSDictionary *)data {
++ (NSDictionary *)normalizedStickerUserInfo:(NSDictionary *)data filename:(NSString *)filename {
     NSMutableDictionary *info = [NSMutableDictionary dictionary];
     NSDictionary *raw = [data[@"stickerUserInfo"] isKindOfClass:[NSDictionary class]] ? data[@"stickerUserInfo"] : data;
     NSDictionary *aliases = @{
@@ -645,8 +645,14 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
             info[key] = @([val doubleValue]);
         }
     }
-    if (info.count > 0 && raw[@"spv"] == nil) {
-        info[@"spv"] = @1;
+    if (info.count > 0) {
+        if (raw[@"spv"] == nil) info[@"spv"] = @1;
+        if (raw[@"sir"] == nil) info[@"sir"] = @NO;
+        if (raw[@"sli"] == nil) info[@"sli"] = @0;
+        if (raw[@"sai"] == nil) info[@"sai"] = @0;
+        if (raw[@"pid"] == nil) info[@"pid"] = @"com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.Stickers.UserGenerated.MessagesExtension";
+        if (raw[@"suri"] == nil) info[@"suri"] = @"sticker:///user/identifier/";
+        if (raw[@"sid"] == nil && filename.length > 0) info[@"sid"] = filename;
     }
     for (NSString *extraKey in @[@"spv", @"sid", @"shash", @"suri", @"pid", @"sir", @"sli", @"sai"]) {
         id val = raw[extraKey];
@@ -655,6 +661,41 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
         }
     }
     return [info copy];
+}
+
++ (IMFileTransfer *)prepareStickerTransferForURL:(NSURL *)originalURL filename:(NSString *)filename stickerUserInfo:(NSDictionary *)stickerUserInfo {
+    IMFileTransferCenter *center = [IMFileTransferCenter sharedInstance];
+    NSString *initGuid = [center guidForNewOutgoingTransferWithLocalURL:originalURL];
+    IMFileTransfer *transfer = (initGuid != nil) ? [center transferForGUID:initGuid] : nil;
+    if (transfer == nil) return nil;
+
+    NSString *persistentPath = [[IMDPersistentAttachmentController sharedInstance] _persistentPathForTransfer:transfer filename:filename highQuality:TRUE chatGUID:nil storeAtExternalPath:TRUE];
+    if ([persistentPath isKindOfClass:[NSString class]] && persistentPath.length > 0) {
+        NSURL *persistentURL = [NSURL fileURLWithPath:persistentPath];
+        NSError *err = nil;
+        if (![[NSFileManager defaultManager] createDirectoryAtURL:[persistentURL URLByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:&err]) {
+            DLog("BLUEBUBBLESHELPER: Failed to create sticker folder: %{public}@", err);
+            return nil;
+        }
+        err = nil;
+        if (![[NSFileManager defaultManager] copyItemAtURL:originalURL toURL:persistentURL error:&err]) {
+            DLog("BLUEBUBBLESHELPER: Failed to copy sticker file: %{public}@", err);
+            return nil;
+        }
+        [center retargetTransfer:[transfer guid] toPath:persistentPath];
+        transfer.localURL = persistentURL;
+    }
+
+    // Must set sticker metadata before registering with imagent so chat.db records is_sticker=1 and sticker_user_info.
+    if ([transfer respondsToSelector:@selector(setIsSticker:)]) {
+        [transfer setIsSticker:YES];
+    }
+    if (stickerUserInfo.count > 0 && [transfer respondsToSelector:@selector(setStickerUserInfo:)]) {
+        [transfer setStickerUserInfo:stickerUserInfo];
+    }
+
+    [center registerTransferWithDaemon:[transfer guid]];
+    return transfer;
 }
 
 + (void)sendSticker:(NSDictionary *)data transaction:(NSString *)transaction {
@@ -669,21 +710,14 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
 
     NSURL *fileUrl = [NSURL fileURLWithPath:filePath];
     NSString *filename = [fileUrl lastPathComponent] ?: @"sticker.png";
-    IMFileTransfer *fileTransfer = [BlueBubblesHelper prepareFileTransferForAttachment:fileUrl filename:filename];
+    NSDictionary *stickerUserInfo = [self normalizedStickerUserInfo:data filename:filename];
+    IMFileTransfer *fileTransfer = [self prepareStickerTransferForURL:fileUrl filename:filename stickerUserInfo:stickerUserInfo];
     NSString *transferGuid = [fileTransfer guid];
     if (transferGuid == nil) {
         if (transaction != nil) {
             SendTransactionResponse(transaction, @{@"error": @"Failed to prepare sticker file transfer"});
         }
         return;
-    }
-
-    if ([fileTransfer respondsToSelector:@selector(setIsSticker:)]) {
-        [fileTransfer setIsSticker:YES];
-    }
-    NSDictionary *stickerUserInfo = [self normalizedStickerUserInfo:data];
-    if (stickerUserInfo.count > 0 && [fileTransfer respondsToSelector:@selector(setStickerUserInfo:)]) {
-        [fileTransfer setStickerUserInfo:stickerUserInfo];
     }
 
     NSMutableAttributedString *attachmentStr = [[NSMutableAttributedString alloc] initWithString:@"\ufffc"];
@@ -712,27 +746,59 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
         long long assocType = ([assocTypeRaw isKindOfClass:[NSNumber class]] || [assocTypeRaw isKindOfClass:[NSString class]])
             ? [assocTypeRaw longLongValue]
             : 1000;
-        NSString *assocGuid = [assocGuidRaw hasPrefix:@"p:"]
-            ? assocGuidRaw
-            : [NSString stringWithFormat:@"p:%ld/%@", (long)partIndex, assocGuidRaw];
 
-        IMMessage *messageToSend = [[IMMessage alloc] initWithSender:nil
-                                                                time:nil
-                                                                text:attachmentStr
-                                                      messageSubject:nil
-                                                   fileTransferGUIDs:@[transferGuid]
-                                                               flags:0x100005
-                                                               error:nil
-                                                                guid:nil
-                                                             subject:nil
-                                               associatedMessageGUID:assocGuid
-                                               associatedMessageType:assocType
-                                              associatedMessageRange:NSMakeRange(0, 1)
-                                                  messageSummaryInfo:nil];
-        [chat sendMessage:messageToSend];
-        if (transaction != nil) {
-            SendTransactionResponse(transaction, @{@"identifier": [[chat lastSentMessage] guid] ?: [NSNull null]});
+        NSString *baseGuid = assocGuidRaw;
+        if ([baseGuid hasPrefix:@"bp:"]) {
+            baseGuid = [baseGuid substringFromIndex:3];
+        } else if ([baseGuid hasPrefix:@"p:"]) {
+            NSRange slash = [baseGuid rangeOfString:@"/"];
+            if (slash.location != NSNotFound && slash.location + 1 < baseGuid.length) {
+                baseGuid = [baseGuid substringFromIndex:slash.location + 1];
+            }
         }
+
+        [BlueBubblesHelper getMessageItem:chat :baseGuid completionBlock:^(IMMessage *targetMessage) {
+            NSRange range = NSMakeRange(0, 1);
+            NSString *assocGuid = ([assocGuidRaw hasPrefix:@"p:"] || [assocGuidRaw hasPrefix:@"bp:"])
+                ? assocGuidRaw
+                : [NSString stringWithFormat:@"p:%ld/%@", (long)partIndex, baseGuid];
+
+            if (targetMessage != nil) {
+                IMMessagePartChatItem *item = BBMessagePartForIndex(targetMessage, partIndex, YES);
+                if (item != nil) {
+                    range = [item messagePartRange];
+                } else {
+                    NSUInteger len = ([targetMessage text].string ?: @"").length;
+                    if (len > 0) range = NSMakeRange(0, len);
+                }
+                if (range.length == 0) range = NSMakeRange(0, 1);
+                if (![assocGuidRaw hasPrefix:@"p:"] && ![assocGuidRaw hasPrefix:@"bp:"]) {
+                    assocGuid = (item != nil && [item text] == nil && ![item isKindOfClass:NSClassFromString(@"IMAttachmentMessagePartChatItem")])
+                        ? [NSString stringWithFormat:@"bp:%@", [targetMessage guid]]
+                        : [NSString stringWithFormat:@"p:%ld/%@", (long)partIndex, [targetMessage guid]];
+                }
+            }
+
+            IMMessage *messageToSend = [[IMMessage alloc] initWithSender:nil
+                                                                    time:nil
+                                                                    text:attachmentStr
+                                                          messageSubject:nil
+                                                       fileTransferGUIDs:@[transferGuid]
+                                                                   flags:0x100005
+                                                                   error:nil
+                                                                    guid:nil
+                                                                 subject:nil
+                                                   associatedMessageGUID:assocGuid
+                                                   associatedMessageType:assocType
+                                                  associatedMessageRange:range
+                                                      messageSummaryInfo:@{@"amc": @0, @"ust": @YES}];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [chat sendMessage:messageToSend];
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, @{@"identifier": [[chat lastSentMessage] guid] ?: [NSNull null]});
+                }
+            });
+        }];
         return;
     }
 
