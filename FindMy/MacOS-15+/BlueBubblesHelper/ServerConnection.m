@@ -8,14 +8,17 @@
 static const uint16_t BBPrivateApiBasePort = 45670;
 static const uint16_t BBMaximumPort = UINT16_MAX;
 static const uid_t BBFirstUserIdentifier = 501;
-static const NSTimeInterval BBReconnectDelaySeconds = 5.0;
+static const NSTimeInterval BBReconnectInitialDelaySeconds = 5.0;
+static const NSTimeInterval BBReconnectMaxDelaySeconds = 60.0;
 static const NSUInteger BBMaximumPendingMessageCount = 100;
+static const NSUInteger BBMaximumMessageLengthBytes = 64 * 1024 * 1024;
 static NSString * const BBFindMyBundleIdentifier = @"com.apple.findmy";
 
 @interface ServerConnection ()
 @property(nonatomic, strong, nullable) GCDAsyncSocket *socket;
 @property(nonatomic, strong) NSMutableArray<NSData *> *pendingMessages;
 @property(nonatomic) BOOL reconnectScheduled;
+@property(nonatomic) NSTimeInterval reconnectDelaySeconds;
 - (nullable NSDictionary *)decodeMessageData:(NSData *)messageData;
 - (uint16_t)serverPort;
 - (void)readNextMessage;
@@ -74,6 +77,11 @@ static os_log_t connectionLog;
 }
 
 - (void)sendMessage:(NSDictionary *)message {
+    if (![NSJSONSerialization isValidJSONObject:message]) {
+        os_log_error(connectionLog, "Refusing to serialize invalid JSON server message");
+        return;
+    }
+
     NSError *serializationError = nil;
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:message options:0 error:&serializationError];
     if (jsonData == nil) {
@@ -109,7 +117,7 @@ static os_log_t connectionLog;
 }
 
 - (void)readNextMessage {
-    [self.socket readDataToData:[GCDAsyncSocket LFData] withTimeout:-1 tag:1];
+    [self.socket readDataToData:[GCDAsyncSocket LFData] withTimeout:-1 maxLength:BBMaximumMessageLengthBytes tag:1];
 }
 
 - (void)writeMessageData:(NSData *)messageData {
@@ -133,9 +141,13 @@ static os_log_t connectionLog;
         return;
     }
 
+    NSTimeInterval delay = self.reconnectDelaySeconds > 0
+        ? self.reconnectDelaySeconds
+        : BBReconnectInitialDelaySeconds;
+    self.reconnectDelaySeconds = MIN(delay * 2.0, BBReconnectMaxDelaySeconds);
     self.reconnectScheduled = YES;
     dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(BBReconnectDelaySeconds * NSEC_PER_SEC)),
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
         dispatch_get_main_queue(),
         ^{
             self.reconnectScheduled = NO;
@@ -150,6 +162,7 @@ static os_log_t connectionLog;
     }
 
     self.reconnectScheduled = NO;
+    self.reconnectDelaySeconds = BBReconnectInitialDelaySeconds;
     os_log(connectionLog, "Connected to BlueBubbles Server on port %{public}hu", port);
     [self sendMessage:@{
         @"event": @"ping",
@@ -201,6 +214,10 @@ static os_log_t connectionLog;
         os_log_error(connectionLog, "Disconnected from BlueBubbles Server: %{public}@", error);
     } else {
         os_log(connectionLog, "Disconnected from BlueBubbles Server");
+    }
+    id helper = [FindMyHelper sharedInstance];
+    if ([helper respondsToSelector:@selector(handleServerDisconnected)]) {
+        [helper handleServerDisconnected];
     }
     [self scheduleReconnect];
 }

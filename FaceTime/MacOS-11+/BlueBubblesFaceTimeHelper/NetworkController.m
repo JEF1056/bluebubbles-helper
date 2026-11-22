@@ -12,10 +12,15 @@
 #import "Logging.h"
 
 static const NSUInteger kBBMaxSocketMessageBytes = 64 * 1024 * 1024;
+static const NSTimeInterval kBBReconnectInitialDelaySeconds = 5.0;
+static const NSTimeInterval kBBReconnectMaxDelaySeconds = 60.0;
 
 @interface NetworkController () {
     NSMutableData *_readBuffer;
+    BOOL _reconnectScheduled;
+    NSTimeInterval _reconnectDelaySeconds;
 }
+- (void)scheduleReconnect;
 @end
 
 @implementation NetworkController
@@ -47,6 +52,26 @@ static id sharedInstance = nil;
   __x > __high ? __high : (__x < __low ? __low : __x);\
   })
 
+- (void)scheduleReconnect {
+    double delayInSeconds = kBBReconnectInitialDelaySeconds;
+    @synchronized (self) {
+        if (_reconnectScheduled) {
+            return;
+        }
+        _reconnectScheduled = YES;
+        delayInSeconds = _reconnectDelaySeconds > 0 ? _reconnectDelaySeconds : kBBReconnectInitialDelaySeconds;
+        _reconnectDelaySeconds = MIN(delayInSeconds * 2.0, kBBReconnectMaxDelaySeconds);
+    }
+    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
+    dispatch_after(popTime, dispatch_get_main_queue(), ^(void) {
+        @synchronized (self) {
+            self->_reconnectScheduled = NO;
+        }
+        DLog("BLUEBUBBLESFACETIMEHELPER: Attempting to reconnect");
+        [self connect];
+    });
+}
+
 - (void)connect {
     // we need to get the port to open the server on (to allow multiple users to use the bundle)
     // we'll base this off the users uid (a unique id for each user, starting from 501)
@@ -54,28 +79,43 @@ static id sharedInstance = nil;
     // then we add this to the base port to get a unique port for the socket
     int port = CLAMP(45670 + getuid()-501, 45670, 65535);
     DLog("BLUEBUBBLESFACETIMEHELPER: Connecting to socket on port %{public}d", port);
-    if (asyncSocket != nil) {
-        asyncSocket.delegate = nil;
-        [asyncSocket disconnect];
+    GCDAsyncSocket *oldSocket = nil;
+    GCDAsyncSocket *sock = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_main_queue()];
+    @synchronized (self) {
+        _reconnectScheduled = NO;
+        oldSocket = asyncSocket;
+        asyncSocket = sock;
+        _readBuffer = [[NSMutableData alloc] init];
     }
-    _readBuffer = [[NSMutableData alloc] init];
-    // connect to socket
-    asyncSocket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_main_queue()];
+    if (oldSocket != nil) {
+        oldSocket.delegate = nil;
+        [oldSocket disconnect];
+    }
     NSError *err = nil;
-    if (![asyncSocket connectToHost:@"localhost" onPort:port error:&err]) {
+    if (![sock connectToHost:@"localhost" onPort:port error:&err]) {
         // If there was an error, it's likely something like "already connected" or "no delegate set"
         DLog("BLUEBUBBLESFACETIMEHELPER: Error connecting to socket: %{public}@", err);
+        @synchronized (self) {
+            if (asyncSocket == sock) {
+                asyncSocket = nil;
+            }
+        }
+        [self scheduleReconnect];
         return;
     }
     // Read LF-delimited frames up to 64MB so multi-byte UTF-8 sequences cannot split across reads.
-    [asyncSocket readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
+    [sock readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
 }
 
 
 
 - (void)disconnect {
-    [_readBuffer setLength:0];
-    [asyncSocket disconnect];
+    GCDAsyncSocket *sock = nil;
+    @synchronized (self) {
+        [_readBuffer setLength:0];
+        sock = asyncSocket;
+    }
+    [sock disconnect];
 }
 
 - (void)sendMessage:(NSDictionary*)data {
@@ -95,11 +135,22 @@ static id sharedInstance = nil;
     // add a newline to the message so back-to-back messages are split and sent correctly
     NSString *jsonMessage = [NSString stringWithFormat:(@"%@\r\n"), message];
     NSData* finalData = [jsonMessage dataUsingEncoding:NSUTF8StringEncoding];
+    GCDAsyncSocket *sock = nil;
+    @synchronized (self) {
+        sock = asyncSocket;
+    }
     DLog("BLUEBUBBLESFACETIMEHELPER: Sending data: %{public}@", data);
-    [asyncSocket writeData:(finalData) withTimeout:(-1) tag:(1)];
+    [sock writeData:(finalData) withTimeout:(-1) tag:(1)];
 }
 
 - (void)socket:(GCDAsyncSocket *)sock didConnectToHost:(NSString *)host port:(UInt16)port {
+    @synchronized (self) {
+        if (sock != asyncSocket) {
+            return;
+        }
+        _reconnectScheduled = NO;
+        _reconnectDelaySeconds = kBBReconnectInitialDelaySeconds;
+    }
     DLog("BLUEBUBBLESFACETIMEHELPER: socket:%{public}p didConnectToHost:%{public}@ port:%{public}hu", sock, host, port);
     NSDictionary *message = @{@"event": @"ping", @"message": @"Helper Connected!"};
     [self sendMessage:message];
@@ -115,7 +166,12 @@ static id sharedInstance = nil;
 }
 
 - (void)socket:(GCDAsyncSocket *)sock didReadData:(NSData *)data withTag:(long)tag {
-    [asyncSocket readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
+    @synchronized (self) {
+        if (sock != asyncSocket) {
+            return;
+        }
+    }
+    [sock readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
     if (data.length == 0) {
         return;
     }
@@ -159,14 +215,15 @@ static id sharedInstance = nil;
 }
 
 - (void)socketDidDisconnect:(GCDAsyncSocket *)sock withError:(NSError *)err {
-    [_readBuffer setLength:0];
+    @synchronized (self) {
+        if (sock != asyncSocket) {
+            return;
+        }
+        asyncSocket = nil;
+        [_readBuffer setLength:0];
+    }
     DLog("BLUEBUBBLESFACETIMEHELPER: Disconnected from server, attempting to reconnect in 5 seconds...");
-    double delayInSeconds = 5.0;
-    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
-    dispatch_after(popTime, dispatch_get_main_queue(), ^(void){
-        DLog("BLUEBUBBLESFACETIMEHELPER: Attempting to reconnect");
-        [self connect];
-    });
+    [self scheduleReconnect];
 }
 
 @end

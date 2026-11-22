@@ -65,6 +65,11 @@ static NSInteger const BBUITableViewScrollPositionMiddle = 2;
 - (nullable id)textLabel;
 - (nullable id)detailTextLabel;
 - (nullable NSString *)text;
+
+- (void)windowDidBecomeFrontmost;
+- (void)windowDidLoseFrontmost;
+- (void)windowDidBecomeVisible;
+- (void)windowDidBecomeOccluded;
 @end
 
 @interface FindMyPeopleFocusController ()
@@ -75,6 +80,7 @@ static NSInteger const BBUITableViewScrollPositionMiddle = 2;
 @property (nonatomic, weak, nullable) id forcedConditionProvider;
 @property (nonatomic, assign) BOOL forcedWindowVisible;
 @property (nonatomic, assign) BOOL forcedFrontmostWindow;
+@property (nonatomic, assign) BOOL lastFocusSwitchedTab;
 
 - (void)recordPeopleDataSource:(id)dataSource tableView:(nullable id)tableView;
 
@@ -433,6 +439,21 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
     }
 
     if ([self focusPeopleTabAndSelectPreparedTargets:targets inRootObjects:nil]) {
+        // Switching from Devices/Items to People can reload the table on the next tick; confirm selection once after layout.
+        if (self.lastFocusSwitchedTab && NSClassFromString(@"UIApplication") != Nil && remainingRetries > 0) {
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                dispatch_get_main_queue(),
+                ^{
+                    FindMyPeopleFocusController *strongSelf = weakSelf;
+                    if (strongSelf == nil || generation != strongSelf.focusGeneration) {
+                        return;
+                    }
+                    [strongSelf focusPeopleTabAndSelectPreparedTargets:targets inRootObjects:nil];
+                }
+            );
+        }
         return;
     }
 
@@ -522,6 +543,7 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
     BOOL switchedTab = [self switchToPeopleTabWithSideBarVCs:sideBarVCs
                                               embeddedTabBars:embeddedTabBars
                                             segmentedControls:segmentedControls];
+    self.lastFocusSwitchedTab = switchedTab;
     if (switchedTab) {
         os_log(focusLog(), "Switched Find My UI to People tab");
     }
@@ -731,11 +753,38 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
         // Switching providers during a retry must reset the old provider without bumping focusGeneration.
         [self resetForcedBackgroundRefreshFlags];
     }
-    if (BBSetBoolIvarIfFalse(conditionProvider, "isWindowVisible")) {
-        self.forcedWindowVisible = YES;
+    BOOL wasFrontmost = NO;
+    BOOL hasFrontmostIvar = BBReadBoolIvar(conditionProvider, "isFrontmostWindow", &wasFrontmost);
+    BOOL wasVisible = NO;
+    BOOL hasVisibleIvar = BBReadBoolIvar(conditionProvider, "isWindowVisible", &wasVisible);
+
+    // Call FMConditionProvider lifecycle hooks in order (frontmost before visible) so FMMediator
+    // cancels backgroundRefreshTimeoutTask, runs Start refreshing, and unpauses FMPeopleProvider.
+    if (!wasFrontmost) {
+        BOOL changed = NO;
+        if ([conditionProvider respondsToSelector:@selector(windowDidBecomeFrontmost)]) {
+            [(id<BBFindMyUIKitProxy>)conditionProvider windowDidBecomeFrontmost];
+            changed = YES;
+        }
+        if (hasFrontmostIvar && BBSetBoolIvarIfFalse(conditionProvider, "isFrontmostWindow")) {
+            changed = YES;
+        }
+        if (changed) {
+            self.forcedFrontmostWindow = YES;
+        }
     }
-    if (BBSetBoolIvarIfFalse(conditionProvider, "isFrontmostWindow")) {
-        self.forcedFrontmostWindow = YES;
+    if (!wasVisible) {
+        BOOL changed = NO;
+        if ([conditionProvider respondsToSelector:@selector(windowDidBecomeVisible)]) {
+            [(id<BBFindMyUIKitProxy>)conditionProvider windowDidBecomeVisible];
+            changed = YES;
+        }
+        if (hasVisibleIvar && BBSetBoolIvarIfFalse(conditionProvider, "isWindowVisible")) {
+            changed = YES;
+        }
+        if (changed) {
+            self.forcedWindowVisible = YES;
+        }
     }
     self.forcedConditionProvider = conditionProvider;
 }
@@ -758,13 +807,23 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
     if (uiApp != nil && [uiApp respondsToSelector:@selector(applicationState)] && [uiApp applicationState] == 0) {
         return;
     }
-    BOOL *visiblePtr = visible ? BBBoolIvarPtr(provider, "isWindowVisible") : NULL;
-    BOOL *frontmostPtr = frontmost ? BBBoolIvarPtr(provider, "isFrontmostWindow") : NULL;
-    if (visiblePtr != NULL) {
-        *visiblePtr = NO;
+    if (frontmost) {
+        if ([provider respondsToSelector:@selector(windowDidLoseFrontmost)]) {
+            [(id<BBFindMyUIKitProxy>)provider windowDidLoseFrontmost];
+        }
+        BOOL *frontmostPtr = BBBoolIvarPtr(provider, "isFrontmostWindow");
+        if (frontmostPtr != NULL) {
+            *frontmostPtr = NO;
+        }
     }
-    if (frontmostPtr != NULL) {
-        *frontmostPtr = NO;
+    if (visible) {
+        if ([provider respondsToSelector:@selector(windowDidBecomeOccluded)]) {
+            [(id<BBFindMyUIKitProxy>)provider windowDidBecomeOccluded];
+        }
+        BOOL *visiblePtr = BBBoolIvarPtr(provider, "isWindowVisible");
+        if (visiblePtr != NULL) {
+            *visiblePtr = NO;
+        }
     }
 }
 

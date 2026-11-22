@@ -40,6 +40,19 @@ enum FindMyDeviceSnapshot {
         ]
     }
 
+    static func fmipManager(from dataSource: Any) -> AnyObject? {
+        guard let mediator = child(named: "mediator", in: dataSource),
+              let devicesProvider = child(named: "devicesProvider", in: mediator),
+              let manager = child(named: "fmipManager", in: devicesProvider) else {
+            return nil
+        }
+        // Only bridge real Swift/ObjC class instances; unit-test struct mocks are not HeapObjects.
+        guard Mirror(reflecting: manager).displayStyle == .class else {
+            return nil
+        }
+        return manager as AnyObject
+    }
+
     private static func errorResponse(_ message: String) -> [String: Any] {
         return [
             "error": message,
@@ -439,6 +452,21 @@ public func blueBubblesFindMyCopyDevicesSnapshot(
     let dataSource = Unmanaged<AnyObject>.fromOpaque(dataSourcePointer).takeUnretainedValue()
     let response = FindMyDeviceSnapshot.response(from: dataSource)
     return Unmanaged.passRetained(response as NSDictionary).toOpaque()
+}
+
+@_cdecl("BlueBubblesFindMyCopyFMIPManager")
+public func blueBubblesFindMyCopyFMIPManager(
+    _ dataSourcePointer: UnsafeMutableRawPointer?
+) -> UnsafeMutableRawPointer? {
+    guard let dataSourcePointer else {
+        return nil
+    }
+
+    let dataSource = Unmanaged<AnyObject>.fromOpaque(dataSourcePointer).takeUnretainedValue()
+    guard let manager = FindMyDeviceSnapshot.fmipManager(from: dataSource) else {
+        return nil
+    }
+    return Unmanaged.passRetained(manager).toOpaque()
 }
 
 @_cdecl("BlueBubblesFindMyCopyPeopleRowsMetadata")

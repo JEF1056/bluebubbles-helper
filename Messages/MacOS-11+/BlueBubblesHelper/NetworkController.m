@@ -14,10 +14,15 @@
 #import "BlueBubblesHelper.h"
 
 static const NSUInteger kBBMaxSocketMessageBytes = 64 * 1024 * 1024;
+static const NSTimeInterval kBBReconnectInitialDelaySeconds = 5.0;
+static const NSTimeInterval kBBReconnectMaxDelaySeconds = 60.0;
 
 @interface NetworkController () {
     NSMutableData *_readBuffer;
+    BOOL _reconnectScheduled;
+    NSTimeInterval _reconnectDelaySeconds;
 }
+- (void)scheduleReconnect;
 @end
 
 @implementation NetworkController
@@ -44,6 +49,25 @@ static os_log_t logger;
 
 #define CLAMP(x, low, high) (MAX(low, MIN(x, high)))
 
+- (void)scheduleReconnect {
+    double delayInSeconds = kBBReconnectInitialDelaySeconds;
+    @synchronized (self) {
+        if (_reconnectScheduled) {
+            return;
+        }
+        _reconnectScheduled = YES;
+        delayInSeconds = _reconnectDelaySeconds > 0 ? _reconnectDelaySeconds : kBBReconnectInitialDelaySeconds;
+        _reconnectDelaySeconds = MIN(delayInSeconds * 2.0, kBBReconnectMaxDelaySeconds);
+    }
+    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
+    dispatch_after(popTime, dispatch_get_main_queue(), ^(void) {
+        @synchronized (self) {
+            self->_reconnectScheduled = NO;
+        }
+        [self connect];
+    });
+}
+
 - (void)connect {
     // we need to get the port to open the server on (to allow multiple users to use the bundle)
     // we'll base this off the users uid (a unique id for each user, starting from 501)
@@ -52,24 +76,34 @@ static os_log_t logger;
     int port = CLAMP(45670 + getuid()-501, 45670, 65535);
     os_log(logger, "Connecting to socket on port %d...", port);
 
-    if (asyncSocket != nil) {
-        asyncSocket.delegate = nil;
-        [asyncSocket disconnect];
+    GCDAsyncSocket *oldSocket = nil;
+    GCDAsyncSocket *sock = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_main_queue()];
+    @synchronized (self) {
+        _reconnectScheduled = NO;
+        oldSocket = asyncSocket;
+        asyncSocket = sock;
+        _readBuffer = [[NSMutableData alloc] init];
     }
-    _readBuffer = [[NSMutableData alloc] init];
-
-    // connect to socket
-    asyncSocket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:dispatch_get_main_queue()];
+    if (oldSocket != nil) {
+        oldSocket.delegate = nil;
+        [oldSocket disconnect];
+    }
 
     NSError *err = nil;
-    if (![asyncSocket connectToHost:@"localhost" onPort:port error:&err]) {
+    if (![sock connectToHost:@"localhost" onPort:port error:&err]) {
         // If there was an error, it's likely something like "already connected" or "no delegate set"
         os_log_error(logger, "Failed to connect to socket! %@", err);
+        @synchronized (self) {
+            if (asyncSocket == sock) {
+                asyncSocket = nil;
+            }
+        }
+        [self scheduleReconnect];
         return;
     }
 
     // Read LF-delimited JSON frames up to 64MB so multi-byte UTF-8 sequences cannot split across chunks.
-    [asyncSocket readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
+    [sock readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
 }
 
 - (void)sendMessage:(NSDictionary*)data {
@@ -89,8 +123,12 @@ static os_log_t logger;
         NSString *jsonMessage = [NSString stringWithFormat:(@"%@\r\n"), message];
         NSData* finalData = [jsonMessage dataUsingEncoding:NSUTF8StringEncoding];
         
+        GCDAsyncSocket *sock = nil;
+        @synchronized (self) {
+            sock = asyncSocket;
+        }
         os_log(logger, "Sending data to server:\r\n%@", data);
-        [asyncSocket writeData:(finalData) withTimeout:(-1) tag:(1)];
+        [sock writeData:(finalData) withTimeout:(-1) tag:(1)];
     }
 }
 
@@ -123,6 +161,13 @@ static os_log_t logger;
 #pragma mark - Socket state change handlers
 
 - (void)socket:(GCDAsyncSocket*)sock didConnectToHost:(NSString*)host port:(UInt16)port {
+    @synchronized (self) {
+        if (sock != asyncSocket) {
+            return;
+        }
+        _reconnectScheduled = NO;
+        _reconnectDelaySeconds = kBBReconnectInitialDelaySeconds;
+    }
     os_log(logger, "Helper socket connected on port:%{public}hu", port);
     
     NSDictionary *message = @{
@@ -136,7 +181,12 @@ static os_log_t logger;
 }
 
 - (void)socket:(GCDAsyncSocket*)sock didReadData:(NSData*)data withTag:(long)tag {
-    [asyncSocket readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
+    @synchronized (self) {
+        if (sock != asyncSocket) {
+            return;
+        }
+    }
+    [sock readDataToData:[GCDAsyncSocket LFData] withTimeout:(-1) maxLength:kBBMaxSocketMessageBytes tag:(1)];
     if (data.length == 0) {
         return;
     }
@@ -189,13 +239,15 @@ static os_log_t logger;
 }
 
 - (void)socketDidDisconnect:(GCDAsyncSocket *)sock withError:(NSError *)err {
-    [_readBuffer setLength:0];
+    @synchronized (self) {
+        if (sock != asyncSocket) {
+            return;
+        }
+        asyncSocket = nil;
+        [_readBuffer setLength:0];
+    }
     os_log_error(logger, "Disconnected from server, attempting to reconnect in 5 seconds...\r\n(%{public}@)", err);
-    double delayInSeconds = 5.0;
-    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
-    dispatch_after(popTime, dispatch_get_main_queue(), ^(void){
-        [self connect];
-    });
+    [self scheduleReconnect];
 }
 
 @end

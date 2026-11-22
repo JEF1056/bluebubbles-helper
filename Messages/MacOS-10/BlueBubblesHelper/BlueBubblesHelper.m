@@ -491,7 +491,12 @@ BlueBubblesHelper *plugin;
             dest = IDSCopyIDForEmailAddress((__bridge CFStringRef)data[@"address"]);
         }
         
-        [[IDSIDQueryController sharedInstance] refreshIDStatusForDestinations:(@[dest]) service:(serviceName) listenerID:(@"SOIDSListener-com.apple.imessage-rest") queue:(dispatch_queue_create("HandleIDS", NULL)) completionBlock:^(NSDictionary *response) {
+        static dispatch_queue_t handleIDSQueue = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            handleIDSQueue = dispatch_queue_create("HandleIDS", NULL);
+        });
+        [[IDSIDQueryController sharedInstance] refreshIDStatusForDestinations:(@[dest]) service:(serviceName) listenerID:(@"SOIDSListener-com.apple.imessage-rest") queue:(handleIDSQueue) completionBlock:^(NSDictionary *response) {
             NSInteger *status = [response.allValues.firstObject integerValue];
             BOOL available = status == 1;
             DLog(@"BLUEBUBBLESHELPER: Status for %@ is %ld", data[@"address"], (long)available);

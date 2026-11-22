@@ -17,6 +17,7 @@ NS_ASSUME_NONNULL_BEGIN
      transactionIdentifier:(nullable NSString *)transactionIdentifier;
 
 - (void)handleServerRegistered;
+- (void)handleServerDisconnected;
 
 @end
 

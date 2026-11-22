@@ -11,6 +11,16 @@
 #import "GCDAsyncSocket.h"
 #import "Logging.h"
 
+static const NSTimeInterval kBBReconnectInitialDelaySeconds = 5.0;
+static const NSTimeInterval kBBReconnectMaxDelaySeconds = 60.0;
+
+@interface NetworkController () {
+    BOOL _reconnectScheduled;
+    NSTimeInterval _reconnectDelaySeconds;
+}
+- (void)scheduleReconnect;
+@end
+
 @implementation NetworkController
 
 @synthesize messageReceivedBlock;
@@ -40,7 +50,30 @@ static id sharedInstance = nil;
   __x > __high ? __high : (__x < __low ? __low : __x);\
   })
 
+- (void)scheduleReconnect {
+    double delayInSeconds = kBBReconnectInitialDelaySeconds;
+    @synchronized (self) {
+        if (_reconnectScheduled) {
+            return;
+        }
+        _reconnectScheduled = YES;
+        delayInSeconds = _reconnectDelaySeconds > 0 ? _reconnectDelaySeconds : kBBReconnectInitialDelaySeconds;
+        _reconnectDelaySeconds = MIN(delayInSeconds * 2.0, kBBReconnectMaxDelaySeconds);
+    }
+    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
+    dispatch_after(popTime, dispatch_get_main_queue(), ^(void){
+        @synchronized (self) {
+            self->_reconnectScheduled = NO;
+        }
+        DLog(@"BLUEBUBBLESHELPER: Attempting to reconnect");
+        [self connect];
+    });
+}
+
 - (void)connect {
+    @synchronized (self) {
+        _reconnectScheduled = NO;
+    }
     // we need to get the port to open the server on (to allow multiple users to use the bundle)
     // we'll base this off the users uid (a unique id for each user, starting from 501)
     // we'll subtract 501 to get an id starting at 0, incremented for each user
@@ -53,6 +86,8 @@ static id sharedInstance = nil;
     if (![asyncSocket connectToHost:@"localhost" onPort:port error:&err]) {
         // If there was an error, it's likely something like "already connected" or "no delegate set"
         DLog(@"BLUEBUBBLESHELPER: Error connecting to socket: %@", err);
+        [self scheduleReconnect];
+        return;
     }
     // initiate the 1st read request in anticipation
     [asyncSocket readDataWithTimeout:(-1) tag:(1)];
@@ -76,6 +111,10 @@ static id sharedInstance = nil;
 }
 
 - (void)socket:(GCDAsyncSocket *)sock didConnectToHost:(NSString *)host port:(UInt16)port {
+    @synchronized (self) {
+        _reconnectScheduled = NO;
+        _reconnectDelaySeconds = kBBReconnectInitialDelaySeconds;
+    }
     DLog(@"BLUEBUBBLESHELPER: socket:%p didConnectToHost:%@ port:%hu", sock, host, port);
     NSDictionary *message = @{@"event": @"ping", @"message": @"Helper Connected!"};
     [self sendMessage:message];
@@ -100,13 +139,8 @@ static id sharedInstance = nil;
 }
 
 - (void)socketDidDisconnect:(GCDAsyncSocket *)sock withError:(NSError *)err {
-    DLog(@"BLUEBUBBLESHELPER: Disconnected from server, attempting to reconnect in 5 seconds...");
-    double delayInSeconds = 5.0;
-    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayInSeconds * NSEC_PER_SEC));
-    dispatch_after(popTime, dispatch_get_main_queue(), ^(void){
-        DLog(@"BLUEBUBBLESHELPER: Attempting to reconnect");
-        [self connect];
-    });
+    DLog(@"BLUEBUBBLESHELPER: Disconnected from server, scheduling reconnect...");
+    [self scheduleReconnect];
 }
 
 @end

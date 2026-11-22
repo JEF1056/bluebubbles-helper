@@ -6,6 +6,10 @@
 - (id)initWithData:(NSData *)data MIMEType:(NSString *)mime;
 @end
 
+@interface BlueBubblesHelper (Stickers)
++ (void)sendSticker:(NSDictionary *)data transaction:(NSString *)transaction;
+@end
+
 // Chat guids actively allowed to send outgoing read receipts during an explicit
 // "mark-chat-read" without suppressReceipt. Default-deny blocks all other receipts
 // (e.g., Catalyst scene restore / window activation / relaunch).
@@ -115,6 +119,9 @@ static void RichLinkStep(NSString *step, id result) {
         return YES;
     } else if ([event isEqualToString:@"send-rich-link"]) {
         [BlueBubblesHelper sendRichLink:(data) transaction:(transaction)];
+        return YES;
+    } else if ([event isEqualToString:@"send-sticker"]) {
+        [BlueBubblesHelper sendSticker:(data) transaction:(transaction)];
         return YES;
     } else if ([event isEqualToString:@"set-nickname-info"]) {
         NSString *displayName = [data[@"displayName"] isKindOfClass:[NSString class]] && [data[@"displayName"] length] > 0 ? data[@"displayName"] : nil;
@@ -610,6 +617,126 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
 - (void)_chat_sendReadReceiptForAllMessages:(id)chat {
     if (BBShouldSuppressChatReceipt(chat)) return;
     ZKOrig(void, chat);
+}
+
+@end
+
+#pragma mark - Sticker sending & iCloud Sticker store XPC
+
+@interface BlueBubblesHelper (Stickers)
++ (void)sendSticker:(NSDictionary *)data transaction:(NSString *)transaction;
+@end
+
+@implementation BlueBubblesHelper (Stickers)
+
++ (NSDictionary *)normalizedStickerUserInfo:(NSDictionary *)data {
+    NSMutableDictionary *info = [NSMutableDictionary dictionary];
+    NSDictionary *raw = [data[@"stickerUserInfo"] isKindOfClass:[NSDictionary class]] ? data[@"stickerUserInfo"] : data;
+    NSDictionary *aliases = @{
+        @"sxs": @"xScalar",
+        @"sys": @"yScalar",
+        @"ssa": @"scale",
+        @"sro": @"rotation",
+        @"spw": @"parentPreviewWidth"
+    };
+    for (NSString *key in aliases) {
+        id val = raw[key] ?: raw[aliases[key]];
+        if ([val isKindOfClass:[NSNumber class]] || [val isKindOfClass:[NSString class]]) {
+            info[key] = @([val doubleValue]);
+        }
+    }
+    if (info.count > 0 && raw[@"spv"] == nil) {
+        info[@"spv"] = @1;
+    }
+    for (NSString *extraKey in @[@"spv", @"sid", @"shash", @"suri", @"pid", @"sir", @"sli", @"sai"]) {
+        id val = raw[extraKey];
+        if (val != nil && val != [NSNull null]) {
+            info[extraKey] = val;
+        }
+    }
+    return [info copy];
+}
+
++ (void)sendSticker:(NSDictionary *)data transaction:(NSString *)transaction {
+    NSString *chatGuid = [data[@"chatGuid"] isKindOfClass:[NSString class]] ? data[@"chatGuid"] : nil;
+    NSString *filePath = [data[@"filePath"] isKindOfClass:[NSString class]] ? data[@"filePath"] : nil;
+    if (chatGuid.length == 0 || filePath.length == 0) {
+        if (transaction != nil) {
+            SendTransactionResponse(transaction, @{@"error": @"Missing chatGuid or filePath for send-sticker"});
+        }
+        return;
+    }
+
+    NSURL *fileUrl = [NSURL fileURLWithPath:filePath];
+    NSString *filename = [fileUrl lastPathComponent] ?: @"sticker.png";
+    IMFileTransfer *fileTransfer = [BlueBubblesHelper prepareFileTransferForAttachment:fileUrl filename:filename];
+    NSString *transferGuid = [fileTransfer guid];
+    if (transferGuid == nil) {
+        if (transaction != nil) {
+            SendTransactionResponse(transaction, @{@"error": @"Failed to prepare sticker file transfer"});
+        }
+        return;
+    }
+
+    if ([fileTransfer respondsToSelector:@selector(setIsSticker:)]) {
+        [fileTransfer setIsSticker:YES];
+    }
+    NSDictionary *stickerUserInfo = [self normalizedStickerUserInfo:data];
+    if (stickerUserInfo.count > 0 && [fileTransfer respondsToSelector:@selector(setStickerUserInfo:)]) {
+        [fileTransfer setStickerUserInfo:stickerUserInfo];
+    }
+
+    NSMutableAttributedString *attachmentStr = [[NSMutableAttributedString alloc] initWithString:@"\ufffc"];
+    [attachmentStr addAttributes:@{
+        @"__kIMBaseWritingDirectionAttributeName": @"-1",
+        @"__kIMFileTransferGUIDAttributeName": transferGuid,
+        @"__kIMFilenameAttributeName": filename,
+        @"__kIMMessagePartAttributeName": @0,
+    } range:NSMakeRange(0, 1)];
+
+    NSString *assocGuidRaw = [data[@"associatedMessageGuid"] isKindOfClass:[NSString class]]
+        ? data[@"associatedMessageGuid"]
+        : ([data[@"selectedMessageGuid"] isKindOfClass:[NSString class]] ? data[@"selectedMessageGuid"] : nil);
+
+    if (assocGuidRaw.length > 0) {
+        IMChat *chat = [[BlueBubblesHelper sharedInstance] getIMChatFromGuid:chatGuid transaction:transaction];
+        if (chat == nil) return;
+
+        id partRaw = (data[@"associatedMessagePart"] != nil && data[@"associatedMessagePart"] != [NSNull null])
+            ? data[@"associatedMessagePart"]
+            : data[@"partIndex"];
+        NSInteger partIndex = ([partRaw isKindOfClass:[NSNumber class]] || [partRaw isKindOfClass:[NSString class]])
+            ? [partRaw integerValue]
+            : 0;
+        id assocTypeRaw = data[@"associatedMessageType"];
+        long long assocType = ([assocTypeRaw isKindOfClass:[NSNumber class]] || [assocTypeRaw isKindOfClass:[NSString class]])
+            ? [assocTypeRaw longLongValue]
+            : 1000;
+        NSString *assocGuid = [assocGuidRaw hasPrefix:@"p:"]
+            ? assocGuidRaw
+            : [NSString stringWithFormat:@"p:%ld/%@", (long)partIndex, assocGuidRaw];
+
+        IMMessage *messageToSend = [[IMMessage alloc] initWithSender:nil
+                                                                time:nil
+                                                                text:attachmentStr
+                                                      messageSubject:nil
+                                                   fileTransferGUIDs:@[transferGuid]
+                                                               flags:0x100005
+                                                               error:nil
+                                                                guid:nil
+                                                             subject:nil
+                                               associatedMessageGUID:assocGuid
+                                               associatedMessageType:assocType
+                                              associatedMessageRange:NSMakeRange(0, 1)
+                                                  messageSummaryInfo:nil];
+        [chat sendMessage:messageToSend];
+        if (transaction != nil) {
+            SendTransactionResponse(transaction, @{@"identifier": [[chat lastSentMessage] guid] ?: [NSNull null]});
+        }
+        return;
+    }
+
+    [BlueBubblesHelper sendMessage:data transfers:@[transferGuid] attributedString:attachmentStr transaction:transaction];
 }
 
 @end

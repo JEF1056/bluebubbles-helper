@@ -16,6 +16,12 @@ static const NSTimeInterval BBFriendListTimeoutSeconds = 5.0;
 static const NSTimeInterval BBLocationRefreshTimeoutSeconds = 8.0;
 static const NSTimeInterval BBDevicesDataSourceTimeoutSeconds = 5.0;
 static const NSTimeInterval BBDevicesDataSourcePollIntervalSeconds = 0.1;
+static const NSTimeInterval BBDevicesActiveRefreshTimeoutSeconds = 8.0;
+static const NSTimeInterval BBDevicesActiveRefreshPollIntervalSeconds = 0.5;
+static const NSTimeInterval BBLiveKeepaliveIntervalSeconds = 15.0;
+static const NSTimeInterval BBLiveKeepaliveMaxTTLSeconds = 600.0;
+
+extern void * _Nullable BlueBubblesFindMyCopyFMIPManager(void * _Nullable dataSource);
 // FindMyLocate.LocatePriority raw values: 0=backgroundAppRefresh, 1=shallow, 2=live, 3=backgroundProactive.
 static const long long BBShallowLocationRefreshPriority = 1;
 static const long long BBLiveLocationRefreshPriority = 2;
@@ -30,14 +36,23 @@ static const long long BBLiveLocationRefreshPriority = 2;
 @property(nonatomic, strong) NSMutableSet<FindMyDevicesRefreshCoordinator *> *activeDeviceRefreshes;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *inFlightRefreshHandleCounts;
 @property(nonatomic) BOOL friendStreamingStarted;
+@property(nonatomic) BOOL friendUpdatesActive;
+@property(nonatomic) NSUInteger connectionGeneration;
+@property(nonatomic) NSUInteger activeForcedDeviceRefreshCount;
 @property(nonatomic, copy, nullable) NSString *activeLiveNormalizedIdentifier;
 @property(nonatomic, copy, nullable) NSString *pendingLiveNormalizedIdentifier;
 @property(nonatomic, strong, nullable) id activeLiveHandleObject;
+@property(nonatomic, copy, nullable) NSArray<NSString *> *activeLiveFocusTargets;
+@property(nonatomic, strong, nullable) dispatch_source_t liveKeepaliveTimer;
+@property(nonatomic, strong, nullable) id<NSObject> liveActivityToken;
 @property(nonatomic) NSUInteger liveSessionGeneration;
 - (nullable FindMyLocateSession *)locateSession;
 - (void)startStreamingLocationsForAllFriends:(FindMyLocateSession *)session
                                focusedHandle:(nullable NSString *)focusedHandle;
 - (void)restoreFocusConditionsIfIdle;
+- (void)stopLiveLocationSession;
+- (void)startLiveKeepaliveTimerForGeneration:(NSUInteger)generation;
+- (void)stopLiveKeepaliveTimer;
 
 - (void)handleFriendsRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier
                                                 data:(nullable NSDictionary *)data;
@@ -45,7 +60,8 @@ static const long long BBLiveLocationRefreshPriority = 2;
                                                    data:(nullable NSDictionary *)data;
 - (void)handleStopLiveLocationForTransactionIdentifier:(nullable NSString *)transactionIdentifier
                                                   data:(nullable NSDictionary *)data;
-- (void)handleDevicesRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier;
+- (void)handleDevicesRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier
+                                                data:(nullable NSDictionary *)data;
 - (void)sendError:(NSString *)errorMessage transactionIdentifier:(nullable NSString *)transactionIdentifier;
 @end
 
@@ -137,7 +153,7 @@ static os_log_t helperLog;
     }
 
     if ([action isEqualToString:@"refresh-findmy-devices"]) {
-        [self handleDevicesRefreshForTransactionIdentifier:transactionIdentifier];
+        [self handleDevicesRefreshForTransactionIdentifier:transactionIdentifier data:data];
         return;
     }
 
@@ -156,15 +172,93 @@ static os_log_t helperLog;
     [self sendError:errorMessage transactionIdentifier:transactionIdentifier];
 }
 
+- (void)startFriendUpdatesForSession:(FindMyLocateSession *)session
+                          generation:(NSUInteger)generation {
+    if (session == nil || self.friendUpdatesActive || self.connectionGeneration != generation) {
+        return;
+    }
+    if (![session respondsToSelector:@selector(startUpdatingFriendsWithInitialUpdates:completion:)]) {
+        return;
+    }
+    self.friendUpdatesActive = YES;
+    __weak typeof(self) weakSelf = self;
+    [session startUpdatingFriendsWithInitialUpdates:YES completion:^{
+        os_log(helperLog, "Find My friend updates started");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            FindMyHelper *strongSelf = weakSelf;
+            if (strongSelf == nil ||
+                strongSelf.connectionGeneration != generation ||
+                strongSelf.activeLocateSession != session ||
+                strongSelf.friendStreamingStarted) {
+                return;
+            }
+            strongSelf.friendStreamingStarted = YES;
+            [strongSelf startStreamingLocationsForAllFriends:session focusedHandle:nil];
+        });
+    }];
+}
+
 - (void)handleServerRegistered {
     dispatch_async(dispatch_get_main_queue(), ^{
+        self.connectionGeneration += 1;
+        NSUInteger generation = self.connectionGeneration;
         FindMyLocateSession *session = [self locateSession];
-        if (session == nil || self.friendStreamingStarted) {
+        if (session == nil) {
+            return;
+        }
+        [self startFriendUpdatesForSession:session generation:generation];
+        if (self.friendStreamingStarted) {
             return;
         }
         self.friendStreamingStarted = YES;
         [self startStreamingLocationsForAllFriends:session focusedHandle:nil];
     });
+}
+
+- (void)handleServerDisconnected {
+    void (^cleanup)(void) = ^{
+        self.connectionGeneration += 1;
+        [self stopLiveLocationSession];
+        self.friendStreamingStarted = NO;
+        self.friendUpdatesActive = NO;
+        FindMyLocateSession *session = self.activeLocateSession;
+        if (session != nil) {
+            NSArray *cachedFriends = nil;
+            if ([session respondsToSelector:@selector(cachedFriendsSharingLocationsWithMe)]) {
+                cachedFriends = [session cachedFriendsSharingLocationsWithMe];
+            } else if ([session respondsToSelector:@selector(cachedFriendsSharingLocationWithMe)]) {
+                cachedFriends = [session cachedFriendsSharingLocationWithMe];
+            }
+            if ([cachedFriends isKindOfClass:[NSArray class]] && cachedFriends.count > 0 &&
+                [session respondsToSelector:@selector(stopRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
+                NSMutableArray *handles = [[NSMutableArray alloc] initWithCapacity:cachedFriends.count];
+                for (id friendRecord in cachedFriends) {
+                    id handle = [FindMyFriendPayload handleForFriendRecord:friendRecord] ?: friendRecord;
+                    if (handle != nil) {
+                        [handles addObject:handle];
+                    }
+                }
+                if (handles.count > 0) {
+                    [session stopRefreshingLocationForHandles:handles
+                                                     priority:BBShallowLocationRefreshPriority
+                                                  isFromGroup:NO
+                                                   completion:^{}];
+                }
+            }
+            SEL stopUpdatingSel = NSSelectorFromString(@"stopUpdatingFriendsWithCompletion:");
+            if ([session respondsToSelector:stopUpdatingSel]) {
+                void (*imp)(id, SEL, void (^)(void)) =
+                    (void (*)(id, SEL, void (^)(void)))[session methodForSelector:stopUpdatingSel];
+                imp(session, stopUpdatingSel, ^{});
+            }
+        }
+        [[FindMyPeopleFocusController sharedInstance] restoreBackgroundRefreshConditions];
+    };
+    if ([NSThread isMainThread]) {
+        cleanup();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), cleanup);
+    }
 }
 
 - (void)sendTransactionResponse:(nullable NSString *)transactionIdentifier payload:(NSDictionary *)payload {
@@ -255,20 +349,7 @@ static os_log_t helperLog;
         }];
     }
 
-    if ([self.activeLocateSession respondsToSelector:@selector(startUpdatingFriendsWithInitialUpdates:completion:)]) {
-        __weak typeof(self) weakSelf = self;
-        [self.activeLocateSession startUpdatingFriendsWithInitialUpdates:YES completion:^{
-            os_log(helperLog, "Find My friend updates started");
-            dispatch_async(dispatch_get_main_queue(), ^{
-                FindMyHelper *strongSelf = weakSelf;
-                if (strongSelf == nil || strongSelf.activeLocateSession == nil || strongSelf.friendStreamingStarted) {
-                    return;
-                }
-                strongSelf.friendStreamingStarted = YES;
-                [strongSelf startStreamingLocationsForAllFriends:strongSelf.activeLocateSession focusedHandle:nil];
-            });
-        }];
-    }
+    [self startFriendUpdatesForSession:self.activeLocateSession generation:self.connectionGeneration];
 
     if ([self.activeLocateSession respondsToSelector:@selector(startMonitoringActiveLocationSharingDeviceChangeWithCompletion:)]) {
         [self.activeLocateSession startMonitoringActiveLocationSharingDeviceChangeWithCompletion:^{
@@ -511,10 +592,13 @@ static os_log_t helperLog;
             );
 
             NSString *canonicalHandle = [FindMyFriendPayload identifierForHandle:targetHandleObject];
+            NSArray<NSString *> *resolvedTargets = focusTargets;
             if (canonicalHandle.length > 0 && ![focusTargets containsObject:canonicalHandle]) {
-                NSArray<NSString *> *updatedTargets = [focusTargets arrayByAddingObject:canonicalHandle];
-                [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:updatedTargets];
+                resolvedTargets = [focusTargets arrayByAddingObject:canonicalHandle];
+                [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:resolvedTargets];
             }
+            strongSelf.activeLiveFocusTargets = resolvedTargets;
+            [strongSelf startLiveKeepaliveTimerForGeneration:sessionGen];
 
             [strongSelf sendTransactionResponse:transactionIdentifier payload:@{
                 @"live": @YES,
@@ -546,11 +630,13 @@ static os_log_t helperLog;
         }
 
         self.liveSessionGeneration += 1;
+        [self stopLiveKeepaliveTimer];
         id handleToStop = self.activeLiveHandleObject;
         NSString *stoppedIdentifier = currentLiveIdentifier ?: normalizedTarget;
         self.activeLiveHandleObject = nil;
         self.activeLiveNormalizedIdentifier = nil;
         self.pendingLiveNormalizedIdentifier = nil;
+        self.activeLiveFocusTargets = nil;
 
         [self stopLiveRefreshForHandleObject:handleToStop normalizedIdentifier:stoppedIdentifier session:session];
         [self restoreFocusConditionsIfIdle];
@@ -564,96 +650,231 @@ static os_log_t helperLog;
 
 - (void)handleFriendsRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier
                                                 data:(nullable NSDictionary *)data {
-    FindMyLocateSession *session = [self locateSession];
-    if (session == nil) {
-        [self sendError:@"FindMyLocateSession is unavailable" transactionIdentifier:transactionIdentifier];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        FindMyLocateSession *session = [self locateSession];
+        if (session == nil) {
+            [self sendError:@"FindMyLocateSession is unavailable" transactionIdentifier:transactionIdentifier];
+            return;
+        }
+
+        NSString *focusedHandle = BBTrimmedString(data[@"handle"]);
+        if (focusedHandle == nil && [data[@"handles"] isKindOfClass:[NSArray class]]) {
+            for (id item in (NSArray *)data[@"handles"]) {
+                focusedHandle = BBTrimmedString(item);
+                if (focusedHandle != nil) {
+                    break;
+                }
+            }
+        }
+        NSArray<NSString *> *focusTargets = [self focusTargetsFromData:data];
+        BOOL targetedOnly = focusedHandle != nil || focusTargets.count > 0;
+        if (targetedOnly && focusTargets.count > 0) {
+            [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:focusTargets];
+        }
+        NSString *normalizedFocusKey = focusedHandle.lowercaseString;
+        [self adjustInFlightRefreshCountForIdentifier:normalizedFocusKey delta:1];
+
+        __weak typeof(self) weakSelf = self;
+        __block __weak FindMyFriendsRefreshCoordinator *weakCoordinator = nil;
+        FindMyFriendsRefreshCoordinator *coordinator = [[FindMyFriendsRefreshCoordinator alloc]
+            initWithSession:session
+            transactionIdentifier:transactionIdentifier
+            focusedHandle:focusedHandle
+            targetedOnly:targetedOnly
+            friendListTimeout:BBFriendListTimeoutSeconds
+            locationRefreshTimeout:BBLocationRefreshTimeoutSeconds
+            responseHandler:^(NSDictionary *response) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [[ServerConnection sharedInstance] sendMessage:response];
+                    FindMyHelper *strongSelf = weakSelf;
+                    if (strongSelf != nil) {
+                        [strongSelf adjustInFlightRefreshCountForIdentifier:normalizedFocusKey delta:-1];
+                        if (weakCoordinator != nil) {
+                            [strongSelf.activeFriendRefreshes removeObject:weakCoordinator];
+                        }
+                        [strongSelf restoreFocusConditionsIfIdle];
+                        if (!strongSelf.friendStreamingStarted) {
+                            strongSelf.friendStreamingStarted = YES;
+                            [strongSelf startStreamingLocationsForAllFriends:session focusedHandle:nil];
+                        }
+                    }
+                });
+            }];
+        if (normalizedFocusKey != nil &&
+            ([normalizedFocusKey isEqualToString:self.activeLiveNormalizedIdentifier] ||
+             [normalizedFocusKey isEqualToString:self.pendingLiveNormalizedIdentifier])) {
+            coordinator.preserveFocusedLiveRefresh = YES;
+        }
+        weakCoordinator = coordinator;
+        [self.activeFriendRefreshes addObject:coordinator];
+        [coordinator start];
+    });
+}
+
+- (void)handleDevicesRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier
+                                                data:(nullable NSDictionary *)data {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        FindMyDevicesDataSourceCapture *dataSourceCapture = [FindMyDevicesDataSourceCapture sharedInstance];
+        [dataSourceCapture installCapture];
+
+        NSString *deviceId = BBTrimmedString(data[@"deviceId"]);
+        BOOL force = [data[@"force"] respondsToSelector:@selector(boolValue)] ? [data[@"force"] boolValue] : NO;
+
+        __weak typeof(self) weakSelf = self;
+        __block __weak FindMyDevicesRefreshCoordinator *weakCoordinator = nil;
+        __block BOOL triggeredForceRefresh = NO;
+        FindMyDevicesRefreshCoordinator *coordinator = [[FindMyDevicesRefreshCoordinator alloc]
+            initWithTransactionIdentifier:transactionIdentifier
+            dataSourceTimeout:BBDevicesDataSourceTimeoutSeconds
+            pollInterval:BBDevicesDataSourcePollIntervalSeconds
+            deviceId:deviceId
+            force:force
+            activeRefreshTimeout:BBDevicesActiveRefreshTimeoutSeconds
+            activePollInterval:BBDevicesActiveRefreshPollIntervalSeconds
+            dataSourceProvider:^id _Nullable {
+                [dataSourceCapture installCapture];
+                return dataSourceCapture.devicesDataSource;
+            }
+            snapshotProvider:^NSDictionary *(id dataSource) {
+                return [FindMyDeviceSnapshotBridge snapshotForDataSource:dataSource];
+            }
+            refreshTrigger:^BOOL(id dataSource, NSString * _Nullable __unused targetDeviceId, BOOL forceRefresh) {
+                void *managerPtr = BlueBubblesFindMyCopyFMIPManager((__bridge void *)dataSource);
+                if (managerPtr == NULL) {
+                    return NO;
+                }
+                id manager = CFBridgingRelease(managerPtr);
+                BOOL triggered = [FindMyDevicesRefreshCoordinator triggerFMIPManagerRefresh:manager];
+                FindMyHelper *strongSelf = weakSelf;
+                if (triggered && forceRefresh && strongSelf != nil) {
+                    strongSelf.activeForcedDeviceRefreshCount += 1;
+                    triggeredForceRefresh = YES;
+                }
+                return triggered;
+            }
+            responseHandler:^(NSDictionary *response) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    FindMyHelper *strongSelf = weakSelf;
+                    BOOL shouldRestoreThrottle = NO;
+                    if (triggeredForceRefresh) {
+                        triggeredForceRefresh = NO;
+                        if (strongSelf != nil) {
+                            if (strongSelf.activeForcedDeviceRefreshCount > 0) {
+                                strongSelf.activeForcedDeviceRefreshCount -= 1;
+                            }
+                            shouldRestoreThrottle = (strongSelf.activeForcedDeviceRefreshCount == 0);
+                        }
+                    }
+                    if (shouldRestoreThrottle && dataSourceCapture.devicesDataSource != nil) {
+                        void *managerPtr = BlueBubblesFindMyCopyFMIPManager((__bridge void *)dataSourceCapture.devicesDataSource);
+                        if (managerPtr != NULL) {
+                            id manager = CFBridgingRelease(managerPtr);
+                            [FindMyDevicesRefreshCoordinator restoreFMIPManagerRefreshThrottle:manager];
+                        }
+                    }
+                    [[ServerConnection sharedInstance] sendMessage:response];
+                    if (strongSelf != nil && weakCoordinator != nil) {
+                        [strongSelf.activeDeviceRefreshes removeObject:weakCoordinator];
+                    }
+                });
+            }];
+        weakCoordinator = coordinator;
+        [self.activeDeviceRefreshes addObject:coordinator];
+        [coordinator start];
+    });
+}
+
+- (void)stopLiveLocationSession {
+    self.liveSessionGeneration += 1;
+    [self stopLiveKeepaliveTimer];
+    id handleToStop = self.activeLiveHandleObject;
+    NSString *stoppedIdentifier = self.activeLiveNormalizedIdentifier ?: self.pendingLiveNormalizedIdentifier;
+    self.activeLiveHandleObject = nil;
+    self.activeLiveNormalizedIdentifier = nil;
+    self.pendingLiveNormalizedIdentifier = nil;
+    self.activeLiveFocusTargets = nil;
+    [self stopLiveRefreshForHandleObject:handleToStop
+                    normalizedIdentifier:stoppedIdentifier
+                                 session:self.activeLocateSession];
+}
+
+- (void)startLiveKeepaliveTimerForGeneration:(NSUInteger)generation {
+    [self stopLiveKeepaliveTimer];
+    if (NSClassFromString(@"UIApplication") == Nil) {
         return;
     }
 
-    NSString *focusedHandle = BBTrimmedString(data[@"handle"]);
-    if (focusedHandle == nil && [data[@"handles"] isKindOfClass:[NSArray class]]) {
-        for (id item in (NSArray *)data[@"handles"]) {
-            focusedHandle = BBTrimmedString(item);
-            if (focusedHandle != nil) {
-                break;
-            }
-        }
-    }
-    NSArray<NSString *> *focusTargets = [self focusTargetsFromData:data];
-    BOOL targetedOnly = focusedHandle != nil || focusTargets.count > 0;
-    if (targetedOnly && focusTargets.count > 0) {
-        [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:focusTargets];
-    }
-    NSString *normalizedFocusKey = focusedHandle.lowercaseString;
-    [self adjustInFlightRefreshCountForIdentifier:normalizedFocusKey delta:1];
+    // Prevent macOS App Nap from throttling background FindMy honing while a person is actively focused.
+    self.liveActivityToken = [[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                          reason:@"BlueBubbles Find My live location honing"];
 
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    uint64_t intervalNs = (uint64_t)(BBLiveKeepaliveIntervalSeconds * NSEC_PER_SEC);
+    dispatch_source_set_timer(
+        timer,
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)intervalNs),
+        intervalNs,
+        (uint64_t)(1.0 * NSEC_PER_SEC)
+    );
     __weak typeof(self) weakSelf = self;
-    __block __weak FindMyFriendsRefreshCoordinator *weakCoordinator = nil;
-    FindMyFriendsRefreshCoordinator *coordinator = [[FindMyFriendsRefreshCoordinator alloc]
-        initWithSession:session
-        transactionIdentifier:transactionIdentifier
-        focusedHandle:focusedHandle
-        targetedOnly:targetedOnly
-        friendListTimeout:BBFriendListTimeoutSeconds
-        locationRefreshTimeout:BBLocationRefreshTimeoutSeconds
-        responseHandler:^(NSDictionary *response) {
-            [[ServerConnection sharedInstance] sendMessage:response];
+    dispatch_source_set_event_handler(timer, ^{
+        FindMyHelper *strongSelf = weakSelf;
+        if (strongSelf == nil ||
+            strongSelf.liveSessionGeneration != generation ||
+            strongSelf.activeLiveHandleObject == nil) {
+            [strongSelf stopLiveKeepaliveTimer];
+            return;
+        }
+        // Keep the person selected in FindMy.app and visibility flags active so FindMy keeps acquiring accurate fixes.
+        if (strongSelf.activeLiveFocusTargets.count > 0) {
+            [[FindMyPeopleFocusController sharedInstance]
+                scheduleFocusPeopleTabAndSelectTargets:strongSelf.activeLiveFocusTargets];
+        }
+        FindMyLocateSession *session = strongSelf.activeLocateSession;
+        if (session != nil) {
+            [FindMyFriendPayload startRefreshingSession:session
+                                                handles:@[strongSelf.activeLiveHandleObject]
+                                               priority:BBLiveLocationRefreshPriority
+                                             completion:^{}];
+        }
+    });
+    self.liveKeepaliveTimer = timer;
+    dispatch_resume(timer);
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(BBLiveKeepaliveMaxTTLSeconds * NSEC_PER_SEC)),
+        dispatch_get_main_queue(),
+        ^{
             FindMyHelper *strongSelf = weakSelf;
-            if (strongSelf != nil) {
-                [strongSelf adjustInFlightRefreshCountForIdentifier:normalizedFocusKey delta:-1];
-                if (weakCoordinator != nil) {
-                    [strongSelf.activeFriendRefreshes removeObject:weakCoordinator];
-                }
-                [strongSelf restoreFocusConditionsIfIdle];
-                if (!strongSelf.friendStreamingStarted) {
-                    strongSelf.friendStreamingStarted = YES;
-                    [strongSelf startStreamingLocationsForAllFriends:session focusedHandle:nil];
-                }
+            if (strongSelf == nil ||
+                strongSelf.liveSessionGeneration != generation ||
+                strongSelf.activeLiveHandleObject == nil) {
+                return;
             }
-        }];
-    if (normalizedFocusKey != nil &&
-        ([normalizedFocusKey isEqualToString:self.activeLiveNormalizedIdentifier] ||
-         [normalizedFocusKey isEqualToString:self.pendingLiveNormalizedIdentifier])) {
-        coordinator.preserveFocusedLiveRefresh = YES;
-    }
-    weakCoordinator = coordinator;
-    [self.activeFriendRefreshes addObject:coordinator];
-    [coordinator start];
+            os_log(helperLog, "Find My live location TTL reached; stopping session");
+            [strongSelf stopLiveLocationSession];
+            [strongSelf restoreFocusConditionsIfIdle];
+        }
+    );
 }
 
-- (void)handleDevicesRefreshForTransactionIdentifier:(nullable NSString *)transactionIdentifier {
-    FindMyDevicesDataSourceCapture *dataSourceCapture = [FindMyDevicesDataSourceCapture sharedInstance];
-    [dataSourceCapture installCapture];
-
-    __weak typeof(self) weakSelf = self;
-    __block __weak FindMyDevicesRefreshCoordinator *weakCoordinator = nil;
-    FindMyDevicesRefreshCoordinator *coordinator = [[FindMyDevicesRefreshCoordinator alloc]
-        initWithTransactionIdentifier:transactionIdentifier
-        dataSourceTimeout:BBDevicesDataSourceTimeoutSeconds
-        pollInterval:BBDevicesDataSourcePollIntervalSeconds
-        dataSourceProvider:^id _Nullable {
-            [dataSourceCapture installCapture];
-            return dataSourceCapture.devicesDataSource;
-        }
-        snapshotProvider:^NSDictionary *(id dataSource) {
-            return [FindMyDeviceSnapshotBridge snapshotForDataSource:dataSource];
-        }
-        responseHandler:^(NSDictionary *response) {
-            [[ServerConnection sharedInstance] sendMessage:response];
-            FindMyHelper *strongSelf = weakSelf;
-            if (strongSelf != nil && weakCoordinator != nil) {
-                [strongSelf.activeDeviceRefreshes removeObject:weakCoordinator];
-            }
-        }];
-    weakCoordinator = coordinator;
-    [self.activeDeviceRefreshes addObject:coordinator];
-    [coordinator start];
+- (void)stopLiveKeepaliveTimer {
+    if (self.liveKeepaliveTimer != nil) {
+        dispatch_source_cancel(self.liveKeepaliveTimer);
+        self.liveKeepaliveTimer = nil;
+    }
+    if (self.liveActivityToken != nil) {
+        [[NSProcessInfo processInfo] endActivity:self.liveActivityToken];
+        self.liveActivityToken = nil;
+    }
 }
 
 - (void)restoreFocusConditionsIfIdle {
     if (self.activeLiveHandleObject == nil &&
         self.pendingLiveNormalizedIdentifier == nil &&
         self.activeFriendRefreshes.count == 0) {
+        [self stopLiveKeepaliveTimer];
         [[FindMyPeopleFocusController sharedInstance] restoreBackgroundRefreshConditions];
     }
 }

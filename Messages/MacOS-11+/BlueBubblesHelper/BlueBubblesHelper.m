@@ -784,7 +784,12 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                 [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Missing or invalid address for availability check"}];
             }
         } else {
-            [[IDSIDQueryController sharedInstance] forceRefreshIDStatusForDestinations:(@[dest]) service:(serviceName) listenerID:(@"SOIDSListener-com.apple.imessage-rest") queue:(dispatch_queue_create("HandleIDS", NULL)) completionBlock:^(NSDictionary *response) {
+            static dispatch_queue_t handleIDSQueue = nil;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                handleIDSQueue = dispatch_queue_create("HandleIDS", NULL);
+            });
+            [[IDSIDQueryController sharedInstance] forceRefreshIDStatusForDestinations:(@[dest]) service:(serviceName) listenerID:(@"SOIDSListener-com.apple.imessage-rest") queue:(handleIDSQueue) completionBlock:^(NSDictionary *response) {
                 NSInteger *status = [response.allValues.firstObject integerValue];
                 BOOL available = status == 1;
                 DLog("BLUEBUBBLESHELPER: Status for %{public}@ is %{public}ld", address, (long)available);
@@ -910,11 +915,25 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                     NSObject* handle = [friend performSelector:(NSSelectorFromString(@"handle"))];
                     if (handle == nil) continue;
                     DLog("BLUEBUBBLESHELPER: test: %@", handle);
+                    __block BOOL stopped = NO;
+                    void (^stopHandleRefresh)(void) = ^{
+                        @synchronized (handle) {
+                            if (stopped) {
+                                return;
+                            }
+                            stopped = YES;
+                        }
+                        if ([session respondsToSelector:@selector(stopRefreshingLocationForHandles:priority:isFromGroup:completion:)]) {
+                            [session stopRefreshingLocationForHandles:@[handle] priority:(1000) isFromGroup:FALSE completion:^{}];
+                        }
+                    };
                     [session startRefreshingLocationForHandles:@[handle] priority:(1000) isFromGroup:FALSE reverseGeocode:TRUE completion:^() {
                         NSObject *test = [session cachedLocationForHandle:handle includeAddress:TRUE];
                         DLog("BLUEBUBBLESHELPER: test: %@", test);
                         DLog("BLUEBUBBLESHELPER: test: %@", [test className]);
+                        stopHandleRefresh();
                     }];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), stopHandleRefresh);
                 }
             }];
             
@@ -1072,12 +1091,14 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
         NSNumber *startNum = rangeDict[@"start"];
         NSNumber *lengthNum = rangeDict[@"length"];
         NSArray *styles = rangeDict[@"styles"];
-        if (startNum == nil || lengthNum == nil || ![styles isKindOfClass:[NSArray class]]) continue;
+        if (![startNum isKindOfClass:[NSNumber class]] || ![lengthNum isKindOfClass:[NSNumber class]] || ![styles isKindOfClass:[NSArray class]]) continue;
 
         NSInteger start = [startNum integerValue];
         NSInteger length = [lengthNum integerValue];
         if (start < 0 || length <= 0) continue;
-        if ((NSUInteger)(start + length) > messageLength) continue;
+        NSUInteger uStart = (NSUInteger)start;
+        NSUInteger uLength = (NSUInteger)length;
+        if (uStart > messageLength || uLength > messageLength - uStart) continue;
 
         NSRange range = NSMakeRange((NSUInteger)start, (NSUInteger)length);
         if ([styles containsObject:@"bold"]) {

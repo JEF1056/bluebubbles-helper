@@ -189,6 +189,9 @@ static NSMutableArray<NSDictionary *> *BBRecordedServerActions = nil;
     BBRecordedServerRegistrations += 1;
 }
 
+- (void)handleServerDisconnected {
+}
+
 @end
 
 static void BBAssert(BOOL condition, NSString *message) {
@@ -419,6 +422,28 @@ static void BBTestReconnectQueue(void) {
     BBAssert(firstSocket.recordedWrites.count == 2, @"a stale socket callback must not register or flush again");
 }
 
+static void BBTestServerConnectionReconnectBackoff(void) {
+    ServerConnection *connection = [[ServerConnection alloc] init];
+    BBRecordingSocket *socket = [[BBRecordingSocket alloc] init];
+    [connection setValue:socket forKey:@"socket"];
+
+    NSArray<NSNumber *> *expectedDelays = @[@10.0, @20.0, @40.0, @60.0, @60.0];
+    for (NSNumber *expected in expectedDelays) {
+        [connection setValue:@NO forKey:@"reconnectScheduled"];
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [connection performSelector:NSSelectorFromString(@"scheduleReconnect")];
+        #pragma clang diagnostic pop
+        double actual = [[connection valueForKey:@"reconnectDelaySeconds"] doubleValue];
+        BBAssert(actual == expected.doubleValue,
+                 [NSString stringWithFormat:@"expected next backoff %.1f, got %.1f", expected.doubleValue, actual]);
+    }
+
+    [connection socket:socket didConnectToHost:@"localhost" port:45675];
+    double resetDelay = [[connection valueForKey:@"reconnectDelaySeconds"] doubleValue];
+    BBAssert(resetDelay == 5.0, @"didConnectToHost must reset reconnectDelaySeconds to 5.0");
+}
+
 static void BBTestDeviceDataSourceReadiness(void) {
     NSObject *dataSource = [[NSObject alloc] init];
     __block id availableDataSource = nil;
@@ -589,6 +614,102 @@ static void BBTestTargetedOnlyRefreshSkipsOtherFriends(void) {
              @"targeted refresh must return only the requested handle");
 }
 
+static void BBTestDeviceActiveRefreshEarlyExitOnTargetAndAccuracy(void) {
+    NSObject *dataSource = [[NSObject alloc] init];
+    __block double targetTs = 1000.0;
+    __block double targetAcc = 100.0;
+    __block double otherTs = 1000.0;
+    __block NSInteger triggerCalls = 0;
+    __block NSString *triggeredDeviceId = nil;
+    __block BOOL triggeredForce = NO;
+    NSMutableArray<NSDictionary *> *capturedResponses = [[NSMutableArray alloc] init];
+
+    FindMyDevicesRefreshCoordinator *coordinator = [[FindMyDevicesRefreshCoordinator alloc]
+        initWithTransactionIdentifier:@"devices-active-early"
+        dataSourceTimeout:0.05
+        pollInterval:0.001
+        deviceId:@"dev-target"
+        force:YES
+        activeRefreshTimeout:0.2
+        activePollInterval:0.005
+        dataSourceProvider:^id _Nullable {
+            return dataSource;
+        }
+        snapshotProvider:^NSDictionary *(id __unused ds) {
+            return @{
+                @"devices": @[
+                    @{@"identifier": @"dev-other", @"location": @{@"timeStamp": @(otherTs), @"horizontalAccuracy": @50.0}},
+                    @{@"identifier": @"dev-target", @"location": @{@"timeStamp": @(targetTs), @"horizontalAccuracy": @(targetAcc)}},
+                ],
+                @"partial": @NO,
+                @"skippedDevices": @0,
+            };
+        }
+        refreshTrigger:^BOOL(id __unused ds, NSString * _Nullable deviceId, BOOL force) {
+            triggerCalls += 1;
+            triggeredDeviceId = deviceId;
+            triggeredForce = force;
+            return YES;
+        }
+        responseHandler:^(NSDictionary *response) {
+            [capturedResponses addObject:response];
+        }];
+    [coordinator start];
+
+    // Unrelated device updates first; targeted refresh must keep waiting.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.008 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        otherTs = 2000.0;
+    });
+    // Target device gets tighter horizontalAccuracy (same timestamp) -> must early-exit.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.025 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        targetAcc = 12.0;
+    });
+
+    BBAssert(BBWaitUntil(^BOOL { return capturedResponses.count == 1; }, 0.3),
+             @"active devices refresh must complete on targeted accuracy improvement");
+    BBAssert(triggerCalls == 1 && [triggeredDeviceId isEqualToString:@"dev-target"] && triggeredForce == YES,
+             @"active devices refresh must invoke trigger once with deviceId and force=YES");
+    NSArray *devices = capturedResponses.firstObject[@"devices"];
+    BBAssert([devices[1][@"location"][@"horizontalAccuracy"] doubleValue] == 12.0,
+             @"active devices refresh must return the updated target location");
+}
+
+static void BBTestDeviceActiveRefreshTimeoutReturnsLatest(void) {
+    NSObject *dataSource = [[NSObject alloc] init];
+    NSMutableArray<NSDictionary *> *capturedResponses = [[NSMutableArray alloc] init];
+
+    FindMyDevicesRefreshCoordinator *coordinator = [[FindMyDevicesRefreshCoordinator alloc]
+        initWithTransactionIdentifier:@"devices-active-timeout"
+        dataSourceTimeout:0.05
+        pollInterval:0.001
+        deviceId:nil
+        force:YES
+        activeRefreshTimeout:0.02
+        activePollInterval:0.005
+        dataSourceProvider:^id _Nullable {
+            return dataSource;
+        }
+        snapshotProvider:^NSDictionary *(id __unused ds) {
+            return @{
+                @"devices": @[@{@"identifier": @"dev-1", @"location": @{@"timeStamp": @1000.0, @"horizontalAccuracy": @65.0}}],
+                @"partial": @NO,
+                @"skippedDevices": @0,
+            };
+        }
+        refreshTrigger:^BOOL(id __unused ds, NSString * _Nullable __unused deviceId, BOOL __unused force) {
+            return YES;
+        }
+        responseHandler:^(NSDictionary *response) {
+            [capturedResponses addObject:response];
+        }];
+    [coordinator start];
+
+    BBAssert(BBWaitUntil(^BOOL { return capturedResponses.count == 1; }, 0.2),
+             @"active devices refresh must terminate at activeRefreshTimeout");
+    BBAssert([capturedResponses.firstObject[@"devices"] count] == 1,
+             @"timeout must still return the latest snapshot");
+}
+
 int main(void) {
     @autoreleasepool {
         BBTestPayload();
@@ -596,11 +717,14 @@ int main(void) {
         BBTestLocationTimeoutAndLateCallbacks();
         BBTestDuplicateImmediateCallback();
         BBTestReconnectQueue();
+        BBTestServerConnectionReconnectBackoff();
         BBTestDeviceDataSourceCapture();
         BBTestDeviceDataSourceReadiness();
         BBTestDeviceDataSourceTimeout();
         BBTestFocusedHandlePrioritizationAndLocatingState();
         BBTestTargetedOnlyRefreshSkipsOtherFriends();
+        BBTestDeviceActiveRefreshEarlyExitOnTargetAndAccuracy();
+        BBTestDeviceActiveRefreshTimeoutReturnsLatest();
         NSLog(@"PASS: FindMyFriendsTests");
     }
 

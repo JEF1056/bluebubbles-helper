@@ -300,6 +300,32 @@ private func testPeopleRowsMetadataExtraction() {
            "friend cell tokens must preserve display name and identifier")
 }
 
+private final class MockClassFMIPManager {}
+private struct MockClassDevicesProvider {
+    let fmipManager: MockClassFMIPManager
+}
+private struct MockClassMediator {
+    let devicesProvider: MockClassDevicesProvider
+}
+private struct MockClassDataSource {
+    let mediator: MockClassMediator
+}
+
+private func testFMIPManagerExtraction() {
+    let structDataSource = dataSource(devices: [])
+    assert(FindMyDeviceSnapshot.fmipManager(from: structDataSource) == nil,
+           "struct mock fmipManager must not bridge as a HeapObject")
+
+    let manager = MockClassFMIPManager()
+    let classDataSource = MockClassDataSource(
+        mediator: MockClassMediator(
+            devicesProvider: MockClassDevicesProvider(fmipManager: manager)
+        )
+    )
+    assert(FindMyDeviceSnapshot.fmipManager(from: classDataSource) === manager,
+           "class fmipManager must be extracted identically")
+}
+
 @main
 private enum FindMyDeviceSnapshotTests {
     static func main() {
@@ -307,6 +333,7 @@ private enum FindMyDeviceSnapshotTests {
         testUnavailableAndEmptyCollections()
         testUnidentifiableDeviceMakesResponsePartial()
         testPeopleRowsMetadataExtraction()
+        testFMIPManagerExtraction()
         print("PASS: FindMyDeviceSnapshotTests")
     }
 }

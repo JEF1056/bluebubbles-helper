@@ -34,6 +34,8 @@
 + (instancetype)sharedInstance;
 - (NSDictionary *)callStatusPayloadForCall:(TUCall *)call;
 - (void)callStatusChanged:(NSNotification *)notification;
+- (void)replayCurrentCallsToController:(NetworkController *)controller;
+- (void)initializeNetworkController;
 - (void)handleMessage:(NetworkController *)controller message:(NSString *)message;
 @end
 
@@ -67,6 +69,8 @@
 @property (nonatomic, getter=isHostedOnCurrentDevice) BOOL hostedOnCurrentDevice;
 @property (nonatomic, strong) id provider;
 @property (nonatomic, getter=isUplinkMuted) BOOL uplinkMuted;
+@property (nonatomic) int filteredOutReason;
+@property (nonatomic, strong) NSDate *dateConnected;
 @end
 
 @implementation MockCall
@@ -100,6 +104,10 @@ static NSError *gNextDialError;
 static MockNetworkController *gMockSharedNetworkController;
 static id gMockGeneratedLink;
 static BOOL gDidInvalidateLink = NO;
+static NSMutableArray *gMockActiveConversations;
+static NSMutableArray *gApprovedPendingMembers;
+static NSMutableArray<MockCall *> *gAnsweredCalls;
+static BOOL gSkipInvalidateCompletion = NO;
 
 @interface MockConversationLink : NSObject
 @property (nonatomic, copy) NSURL *URL;
@@ -122,10 +130,16 @@ static BOOL gDidInvalidateLink = NO;
 }
 - (void)bb_test_invalidateLink:(TUConversationLink *)link completionHandler:(void (^)(BOOL, NSError *))completion {
     gDidInvalidateLink = YES;
-    if (completion) completion(YES, nil);
+    if (!gSkipInvalidateCompletion && completion) completion(YES, nil);
 }
 - (NSSet *)bb_test_activatedConversationLinks {
     return gMockGeneratedLink ? [NSSet setWithObject:gMockGeneratedLink] : [NSSet set];
+}
+- (NSSet *)bb_test_activeConversations {
+    return [NSSet setWithArray:(gMockActiveConversations ?: @[])];
+}
+- (void)bb_test_approvePendingMember:(id)member forConversation:(id)convo {
+    if (member != nil) [gApprovedPendingMembers addObject:@{@"member": member, @"convo": convo ?: [NSNull null]}];
 }
 @end
 
@@ -164,6 +178,9 @@ static BOOL gDidInvalidateLink = NO;
 - (TUCall *)bb_test_joinConversationWithConversationRequest:(id)request {
     gLastJoinRequest = request;
     return (TUCall *)gNextDialCall;
+}
+- (void)bb_test_answerOrJoinCall:(TUCall *)call {
+    if (call != nil) [gAnsweredCalls addObject:(MockCall *)call];
 }
 @end
 
@@ -653,10 +670,233 @@ static void TestTUProxyCallNilCallUUIDFallback(BLUEBUBBLESFACETIMEHELPER *helper
     printf("PASS: TestTUProxyCallNilCallUUIDFallback\n");
 }
 
+@interface MockParticipant : NSObject
+@property (nonatomic, getter=isLightweight) BOOL lightweight;
+@property (nonatomic, getter=isLocalAccountHandle) BOOL localAccountHandle;
+@end
+
+@implementation MockParticipant
+@end
+
+@interface MockConversation : NSObject
+@property (nonatomic, strong) NSUUID *UUID;
+@property (nonatomic, strong) NSUUID *groupUUID;
+@property (nonatomic, strong) MockConversationLink *link;
+@property (nonatomic) NSInteger state;
+@property (nonatomic, getter=isPendingConversation) BOOL pendingConversation;
+@property (nonatomic) BOOL hasJoined;
+@property (nonatomic) BOOL hasReceivedLetMeInRequest;
+@property (nonatomic) NSInteger letMeInRequestState;
+@property (nonatomic, copy) NSSet *pendingMembers;
+@property (nonatomic, copy) NSSet *remoteMembers;
+@property (nonatomic, copy) NSSet *activeRemoteParticipants;
+@property (nonatomic, copy) NSSet *activeLightweightParticipants;
+@end
+
+@implementation MockConversation
+@end
+
+@interface BLUEBUBBLESFACETIMEHELPER (ConversationDebugTest)
+- (NSDictionary *)conversationDebugDictionary:(id)convo;
+@end
+
+static void TestConversationDebugDictionary(BLUEBUBBLESFACETIMEHELPER *helper) {
+    MockParticipant *webUser = [[MockParticipant alloc] init];
+    webUser.lightweight = YES;
+    MockParticipant *callee = [[MockParticipant alloc] init];
+    callee.lightweight = NO;
+    callee.localAccountHandle = NO;
+
+    MockConversationLink *link = [[MockConversationLink alloc] init];
+    link.URL = [NSURL URLWithString:@"https://facetime.apple.com/join#v=1&p=monitor-test"];
+    link.groupUUID = [NSUUID UUID];
+
+    MockConversation *convo = [[MockConversation alloc] init];
+    convo.UUID = [NSUUID UUID];
+    convo.groupUUID = link.groupUUID;
+    convo.link = link;
+    convo.state = 2;
+    convo.hasJoined = NO;
+    convo.activeRemoteParticipants = [NSSet setWithObjects:webUser, callee, nil];
+    convo.activeLightweightParticipants = [NSSet setWithObject:webUser];
+    convo.remoteMembers = [NSSet set];
+    convo.pendingMembers = [NSSet set];
+
+    NSDictionary *dict = [helper conversationDebugDictionary:convo];
+    AssertTrue([dict[@"link"] isEqualToString:@"https://facetime.apple.com/join#v=1&p=monitor-test"], @"Expected link in conversation debug dict");
+    AssertTrue([dict[@"hasJoined"] isEqual:@NO], @"Expected hasJoined=NO");
+    AssertTrue([dict[@"activeRemoteParticipantCount"] isEqual:@2], @"Expected 2 active remote participants");
+    AssertTrue([dict[@"activeLightweightParticipantCount"] isEqual:@1], @"Expected 1 lightweight participant");
+    AssertTrue([dict[@"activeNonLightweightParticipantCount"] isEqual:@1], @"Expected 1 non-lightweight participant");
+    printf("PASS: TestConversationDebugDictionary\n");
+}
+
+@interface MockConversationMember : NSObject
+@property (nonatomic, strong) TUHandle *handle;
+@end
+@implementation MockConversationMember
+@end
+
+static void TestSilencedAndFilteredCallPayload(BLUEBUBBLESFACETIMEHELPER *helper) {
+    // 1. First-seen incoming status 6, never connected, filteredOutReason=6 -> is_incoming_silenced=YES
+    MockCall *silenced = [[MockCall alloc] init];
+    silenced.callUUID = @"silenced-uuid-1";
+    silenced.callStatus = 6;
+    silenced.outgoing = NO;
+    silenced.dateConnected = nil;
+    silenced.filteredOutReason = 6;
+    NSDictionary *p1 = [helper callStatusPayloadForCall:(TUCall *)silenced];
+    AssertTrue([p1[@"filtered_out_reason"] isEqual:@6], @"Expected filtered_out_reason == 6");
+    AssertTrue([p1[@"is_incoming_silenced"] isEqual:@YES], @"First-seen incoming status 6 must set is_incoming_silenced=YES");
+
+    // 2. Normal incoming call: status 4 first, then status 6 without connecting -> is_incoming_silenced=NO
+    MockCall *normalMissed = [[MockCall alloc] init];
+    normalMissed.callUUID = @"normal-missed-uuid-2";
+    normalMissed.callStatus = 4;
+    normalMissed.outgoing = NO;
+    normalMissed.dateConnected = nil;
+    normalMissed.filteredOutReason = 0;
+    NSDictionary *p2a = [helper callStatusPayloadForCall:(TUCall *)normalMissed];
+    AssertTrue([p2a[@"is_incoming_silenced"] isEqual:@NO], @"Status 4 must not be silenced");
+    normalMissed.callStatus = 6;
+    NSDictionary *p2b = [helper callStatusPayloadForCall:(TUCall *)normalMissed];
+    AssertTrue([p2b[@"is_incoming_silenced"] isEqual:@NO], @"Call seen at status 4 before status 6 must set is_incoming_silenced=NO");
+
+    // 3. First-seen status 6 that had connected or was outgoing -> is_incoming_silenced=NO
+    MockCall *connectedCall = [[MockCall alloc] init];
+    connectedCall.callUUID = @"connected-uuid-3";
+    connectedCall.callStatus = 6;
+    connectedCall.outgoing = NO;
+    connectedCall.dateConnected = [NSDate date];
+    AssertTrue([[helper callStatusPayloadForCall:(TUCall *)connectedCall][@"is_incoming_silenced"] isEqual:@NO], @"Connected call must set is_incoming_silenced=NO");
+
+    MockCall *outgoingCall = [[MockCall alloc] init];
+    outgoingCall.callUUID = @"outgoing-uuid-4";
+    outgoingCall.callStatus = 6;
+    outgoingCall.outgoing = YES;
+    AssertTrue([[helper callStatusPayloadForCall:(TUCall *)outgoingCall][@"is_incoming_silenced"] isEqual:@NO], @"Outgoing call must set is_incoming_silenced=NO");
+
+    printf("PASS: TestSilencedAndFilteredCallPayload\n");
+}
+
+static void TestImmediateObserversAndReplay(BLUEBUBBLESFACETIMEHELPER *helper) {
+    // Verify immediate observer registration (no 5s delay)
+    [helper initializeNetworkController];
+    [gMockSharedNetworkController.sentMessages removeAllObjects];
+
+    MockCall *ringing = [[MockCall alloc] init];
+    ringing.callUUID = @"immediate-ring-uuid";
+    ringing.callStatus = 4;
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"TUCallCenterCallStatusChangedNotification" object:ringing];
+    AssertTrue(gMockSharedNetworkController.sentMessages.count == 1, @"Observer must fire immediately without 5s delay");
+    AssertTrue([gMockSharedNetworkController.sentMessages.lastObject[@"data"][@"call_uuid"] isEqualToString:@"immediate-ring-uuid"], @"Expected immediate call status event");
+
+    // Verify replayCurrentCallsToController: replays current TUCallCenter calls
+    [gMockCalls removeAllObjects];
+    gMockCalls[@"immediate-ring-uuid"] = ringing;
+    MockNetworkController *nc = [[MockNetworkController alloc] init];
+    [helper replayCurrentCallsToController:nc];
+    AssertTrue(nc.sentMessages.count == 1, @"Expected 1 replayed call on connect");
+    AssertTrue([nc.sentMessages.firstObject[@"event"] isEqualToString:@"ft-call-status-changed"], @"Expected ft-call-status-changed on replay");
+    AssertTrue([nc.sentMessages.firstObject[@"data"][@"call_uuid"] isEqualToString:@"immediate-ring-uuid"], @"Expected replayed call_uuid");
+    [gMockCalls removeAllObjects];
+
+    printf("PASS: TestImmediateObserversAndReplay\n");
+}
+
+static void TestAnswerCallAndBatchedMessages(BLUEBUBBLESFACETIMEHELPER *helper) {
+    MockNetworkController *nc = [[MockNetworkController alloc] init];
+    [gMockSharedNetworkController.sentMessages removeAllObjects];
+    [gAnsweredCalls removeAllObjects];
+    [gMockCalls removeAllObjects];
+
+    // 1. Unknown call replies via replyController (not sharedInstance) with "Call not found!"
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"answer-call",
+        @"transactionId": @"tx-a1",
+        @"data": @{@"callUUID": @"missing-answer-uuid"}
+    })];
+    AssertTrue(nc.sentMessages.count == 1, @"answer-call error must reply via replyController");
+    AssertTrue(gMockSharedNetworkController.sentMessages.count == 0, @"answer-call must not reply via sharedInstance");
+    AssertTrue([nc.sentMessages.firstObject[@"error"] isEqualToString:@"Call not found!"], @"Expected Call not found! error");
+
+    // 2. Batched }\n{ messages both execute
+    MockCall *ringCall = [[MockCall alloc] init];
+    ringCall.callUUID = @"batch-ring-uuid";
+    ringCall.callStatus = 4;
+    gMockCalls[@"batch-ring-uuid"] = ringCall;
+
+    [nc.sentMessages removeAllObjects];
+    NSString *m1 = JsonString(@{@"action": @"answer-call", @"transactionId": @"tx-b1", @"data": @{@"callUUID": @"batch-ring-uuid"}});
+    NSString *m2 = JsonString(@{@"action": @"set-muted", @"transactionId": @"tx-b2", @"data": @{@"callUUID": @"batch-ring-uuid", @"muted": @YES}});
+    [helper handleMessage:nc message:[NSString stringWithFormat:@"%@\n%@", m1, m2]];
+    AssertTrue(gAnsweredCalls.count == 1 && gAnsweredCalls.firstObject == ringCall, @"First batched message must answer call");
+    AssertTrue(ringCall.isUplinkMuted == YES, @"Second batched message must mute call");
+    AssertTrue(nc.sentMessages.count == 2, @"Both batched messages must reply");
+    AssertTrue([nc.sentMessages[0][@"transactionId"] isEqualToString:@"tx-b1"], @"Expected tx-b1 reply");
+    AssertTrue([nc.sentMessages[1][@"transactionId"] isEqualToString:@"tx-b2"], @"Expected tx-b2 reply");
+
+    [gMockCalls removeAllObjects];
+    printf("PASS: TestAnswerCallAndBatchedMessages\n");
+}
+
+static void TestAdmitAnyPendingMemberAndInvalidateTimeout(BLUEBUBBLESFACETIMEHELPER *helper) {
+    MockNetworkController *nc = [[MockNetworkController alloc] init];
+    [gApprovedPendingMembers removeAllObjects];
+
+    NSUUID *conv1UUID = [NSUUID UUID];
+    NSUUID *conv2UUID = [NSUUID UUID];
+    MockConversationMember *mem1 = [[MockConversationMember alloc] init];
+    mem1.handle = [TUHandle handleWithDestinationID:@"alice@icloud.com"];
+    MockConversationMember *mem2 = [[MockConversationMember alloc] init];
+    mem2.handle = [TUHandle handleWithDestinationID:@"bob@icloud.com"];
+
+    MockConversation *c1 = [[MockConversation alloc] init];
+    c1.groupUUID = conv1UUID;
+    c1.pendingMembers = [NSSet setWithObject:mem1];
+    MockConversation *c2 = [[MockConversation alloc] init];
+    c2.groupUUID = conv2UUID;
+    c2.pendingMembers = [NSSet setWithObject:mem2];
+    gMockActiveConversations = [NSMutableArray arrayWithObjects:c1, c2, nil];
+
+    // Filtered by conversationUUID
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"admit-any-pending-member",
+        @"transactionId": @"tx-admit-1",
+        @"data": @{@"conversationUUID": [[conv1UUID UUIDString] lowercaseString]}
+    })];
+    AssertTrue(gApprovedPendingMembers.count == 1, @"Expected only 1 conversation's pending member approved");
+    NSDictionary *admitData = nc.sentMessages.lastObject[@"data"];
+    AssertTrue([admitData[@"admittedCount"] isEqual:@1], @"Expected admittedCount == 1");
+    AssertTrue([admitData[@"admittedMembers"] count] == 1, @"Expected 1 admittedMembers entry");
+    AssertTrue([admitData[@"admittedParticipants"] isEqualToArray:@[@"alice@icloud.com"]], @"Expected admittedParticipants string array");
+
+    // invalidate-link timeout replies with error
+    MockConversationLink *tLink = [[MockConversationLink alloc] init];
+    tLink.URL = [NSURL URLWithString:@"https://facetime.apple.com/join#v=1&p=timeout"];
+    tLink.groupUUID = [NSUUID UUID];
+    gMockGeneratedLink = tLink;
+    gSkipInvalidateCompletion = YES;
+    [nc.sentMessages removeAllObjects];
+    [helper handleMessage:nc message:JsonString(@{
+        @"action": @"invalidate-link",
+        @"transactionId": @"tx-inv-timeout",
+        @"data": @{@"url": [tLink.URL absoluteString]}
+    })];
+    [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:5.2]];
+    gSkipInvalidateCompletion = NO;
+    AssertTrue(nc.sentMessages.count == 1 && nc.sentMessages.firstObject[@"error"] != nil, @"Expected invalidate-link timeout error reply");
+
+    [gMockActiveConversations removeAllObjects];
+    printf("PASS: TestAdmitAnyPendingMemberAndInvalidateTimeout\n");
+}
+
 int main(void) {
     @autoreleasepool {
         gMockCalls = [NSMutableDictionary dictionary];
         gDisconnectedCalls = [NSMutableArray array];
+        gApprovedPendingMembers = [NSMutableArray array];
+        gAnsweredCalls = [NSMutableArray array];
         gMockSharedNetworkController = [[MockNetworkController alloc] init];
 
         SwizzleSelector([NetworkController class], @selector(sharedInstance), @selector(bb_test_sharedInstance), YES);
@@ -667,19 +907,27 @@ int main(void) {
         SwizzleSelector([TUCallCenter class], @selector(disconnectCall:withReason:), @selector(bb_test_disconnectCall:withReason:), NO);
         SwizzleSelector([TUCallCenter class], @selector(dialWithRequest:completionWithError:), @selector(bb_test_dialWithRequest:completionWithError:), NO);
         SwizzleSelector([TUCallCenter class], @selector(joinConversationWithConversationRequest:), @selector(bb_test_joinConversationWithConversationRequest:), NO);
+        SwizzleSelector([TUCallCenter class], @selector(answerOrJoinCall:), @selector(bb_test_answerOrJoinCall:), NO);
         SwizzleSelector([TUConversationManager class], @selector(generateLinkWithInvitedMemberHandles:linkLifetimeScope:completionHandler:), @selector(bb_test_generateLinkWithInvitedMemberHandles:linkLifetimeScope:completionHandler:), NO);
         SwizzleSelector([TUConversationManager class], @selector(invalidateLink:completionHandler:), @selector(bb_test_invalidateLink:completionHandler:), NO);
         SwizzleSelector([TUConversationManager class], @selector(activatedConversationLinks), @selector(bb_test_activatedConversationLinks), NO);
+        SwizzleSelector([TUConversationManager class], @selector(activeConversations), @selector(bb_test_activeConversations), NO);
+        SwizzleSelector([TUConversationManager class], @selector(approvePendingMember:forConversation:), @selector(bb_test_approvePendingMember:forConversation:), NO);
 
         BLUEBUBBLESFACETIMEHELPER *helper = [BLUEBUBBLESFACETIMEHELPER sharedInstance];
         TestCallStatusMetadataSerialization(helper);
+        TestSilencedAndFilteredCallPayload(helper);
+        TestImmediateObserversAndReplay(helper);
         TestDeclineAndLeaveCall(helper);
+        TestAnswerCallAndBatchedMessages(helper);
+        TestAdmitAnyPendingMemberAndInvalidateTimeout(helper);
         TestSetMuted(helper);
         TestStartCall(helper);
         TestGenerateLink(helper);
         TestPlayDtmf(helper);
         TestNetworkControllerFramingAndTypeGuards(helper);
         TestTUProxyCallNilCallUUIDFallback(helper);
+        TestConversationDebugDictionary(helper);
 
         // Test end-and-invalidate-call
         MockConversationLink *endLink = [[MockConversationLink alloc] init];

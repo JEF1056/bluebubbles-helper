@@ -54,6 +54,7 @@ static NSInteger CaptureDevicesDataSourceAndCountRows(id dataSource, SEL selecto
             }
 
             IMP currentImplementation = method_getImplementation(rowCountMethod);
+            originalDevicesRowCountImplementation = (FindMyDevicesRowCountImplementation)currentImplementation;
             const char *typeEncoding = method_getTypeEncoding(rowCountMethod);
             BOOL addedOverride = class_addMethod(
                 dataSourceClass,
@@ -62,13 +63,15 @@ static NSInteger CaptureDevicesDataSourceAndCountRows(id dataSource, SEL selecto
                 typeEncoding
             );
             if (!addedOverride) {
-                currentImplementation = method_setImplementation(
+                IMP prevImplementation = method_setImplementation(
                     rowCountMethod,
                     (IMP)CaptureDevicesDataSourceAndCountRows
                 );
+                if (prevImplementation != NULL) {
+                    originalDevicesRowCountImplementation = (FindMyDevicesRowCountImplementation)prevImplementation;
+                }
             }
 
-            originalDevicesRowCountImplementation = (FindMyDevicesRowCountImplementation)currentImplementation;
             self.isCaptureInstalled = YES;
             return;
         }

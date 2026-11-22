@@ -37,6 +37,8 @@ static NSArray *BBMockCachedFriends = nil;
 static NSMutableDictionary<NSString *, id> *BBMockCachedLocations = nil;
 static FindMyLocationUpdateCallback BBLiveCallback = nil;
 static BOOL BBUseAsyncDelayedFriendResolution = NO;
+static NSUInteger BBStartUpdatingFriendsCount = 0;
+static NSUInteger BBStopUpdatingFriendsCount = 0;
 
 @implementation FindMyLocateSession
 
@@ -45,6 +47,13 @@ static BOOL BBUseAsyncDelayedFriendResolution = NO;
 }
 
 - (void)startUpdatingFriendsWithInitialUpdates:(BOOL)includeInitialUpdates completion:(FindMyCompletion)completion {
+    (void)includeInitialUpdates;
+    BBStartUpdatingFriendsCount += 1;
+    completion();
+}
+
+- (void)stopUpdatingFriendsWithCompletion:(FindMyCompletion)completion {
+    BBStopUpdatingFriendsCount += 1;
     completion();
 }
 
@@ -218,9 +227,33 @@ static BOOL BBWaitUntil(BOOL (^condition)(void), NSTimeInterval timeoutSeconds) 
     BOOL isWindowVisible;
     BOOL isFrontmostWindow;
 }
+@property(nonatomic, strong) NSMutableArray<NSString *> *lifecycleEvents;
 @end
 
 @implementation BBMockFMConditionProvider
+- (instancetype)init {
+    self = [super init];
+    if (self != nil) {
+        _lifecycleEvents = [[NSMutableArray alloc] init];
+    }
+    return self;
+}
+- (void)windowDidBecomeFrontmost {
+    isFrontmostWindow = YES;
+    [self.lifecycleEvents addObject:@"frontmost"];
+}
+- (void)windowDidBecomeVisible {
+    isWindowVisible = YES;
+    [self.lifecycleEvents addObject:@"visible"];
+}
+- (void)windowDidLoseFrontmost {
+    isFrontmostWindow = NO;
+    [self.lifecycleEvents addObject:@"loseFrontmost"];
+}
+- (void)windowDidBecomeOccluded {
+    isWindowVisible = NO;
+    [self.lifecycleEvents addObject:@"occluded"];
+}
 @end
 
 @interface BBMockPeopleMediator : NSObject {
@@ -447,6 +480,8 @@ static void BBTestPeopleFocusAndHelperIntegration(
              @"FMEmbeddedTabBar.peopleTabItem onButtonTapped must be invoked when unselected");
     BBAssert(conditionProvider->isWindowVisible && conditionProvider->isFrontmostWindow,
              @"background visibility flags must allow FindMy refresh without stealing OS focus");
+    BBAssert(([conditionProvider.lifecycleEvents isEqualToArray:@[@"frontmost", @"visible"]]),
+             @"FMConditionProvider must receive windowDidBecomeFrontmost before windowDidBecomeVisible");
     BBAssert(tableDelegate.didSelectCount == 1, @"tableView:didSelectRowAtIndexPath: must fire");
     BBAssert([tableView.selectedIndexPath indexAtPosition:0] == 2 &&
              [tableView.selectedIndexPath indexAtPosition:1] == 1,
@@ -549,6 +584,9 @@ static void BBTestPeopleFocusAndHelperIntegration(
              @"stop after live focus must complete");
     BBAssert(!conditionProvider->isWindowVisible && !conditionProvider->isFrontmostWindow,
              @"stopping live session while Find My is inactive must restore forced window visibility flags");
+    BBAssert([conditionProvider.lifecycleEvents containsObject:@"loseFrontmost"] &&
+             [conditionProvider.lifecycleEvents containsObject:@"occluded"],
+             @"stopping live session must invoke windowDidLoseFrontmost and windowDidBecomeOccluded");
 
     // 9f. Switching condition providers during a focus retry must reset old provider without cancelling retry.
     BBMockFMConditionProvider *conditionProvider2 = [[BBMockFMConditionProvider alloc] init];
@@ -733,6 +771,30 @@ int main(void) {
                  @"cleanup stop for bob must complete");
 
         BBTestPeopleFocusAndHelperIntegration(helper, socket);
+
+        // 7. Disconnect stops live + friend streaming & restores background conditions; reconnect restarts friend updates
+        [BBRecordedStarts removeAllObjects];
+        [BBRecordedStops removeAllObjects];
+        [socket.sentMessages removeAllObjects];
+        [helper handleServerAction:@"start-findmy-live-location"
+                              data:@{@"handle": @"alice@example.com"}
+             transactionIdentifier:@"tx-disconnect-live"];
+        BBAssert(BBWaitUntil(^BOOL { return BBRecordedStarts.count >= 1 && socket.sentMessages.count >= 1; }, 0.5),
+                 @"live start before disconnect must complete");
+
+        [BBRecordedStops removeAllObjects];
+        NSUInteger startFriendsBefore = BBStartUpdatingFriendsCount;
+        NSUInteger stopFriendsBefore = BBStopUpdatingFriendsCount;
+        [helper handleServerDisconnected];
+        BBAssert(BBWaitUntil(^BOOL {
+            return BBRecordedStops.count >= 2 && BBStopUpdatingFriendsCount == stopFriendsBefore + 1;
+        }, 0.5), @"disconnect must stop live handle, cached friend handles, and friend updates");
+
+        [BBRecordedStarts removeAllObjects];
+        [helper handleServerRegistered];
+        BBAssert(BBWaitUntil(^BOOL {
+            return BBStartUpdatingFriendsCount == startFriendsBefore + 1 && BBRecordedStarts.count >= 1;
+        }, 0.5), @"reconnect must restart friend updates and friend streaming");
 
         NSLog(@"PASS: FindMyHelperLiveTests");
     }

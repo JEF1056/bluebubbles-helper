@@ -100,9 +100,12 @@ static void BBSendReply(NetworkController *controller, NSString *transaction, NS
     [(controller ?: [NetworkController sharedInstance]) sendMessage:payload];
 }
 
-@interface BLUEBUBBLESFACETIMEHELPER : NSObject
+@interface BLUEBUBBLESFACETIMEHELPER : NSObject {
+    BOOL _listenersRegistered;
+}
 + (instancetype)sharedInstance;
 - (void)callStatusChanged:(NSNotification *)notification;
+- (void)replayCurrentCallsToController:(NetworkController *)controller;
 - (void)handleMessage:(NetworkController *)controller message:(NSString *)message;
 @end
 
@@ -210,15 +213,35 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
     NSDictionary *message = @{@"event": @"ping", @"message": @"Helper Connected!"};
     [controller sendMessage:message];
 
-    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC));
-    dispatch_after(popTime, dispatch_get_main_queue(), ^(void){
+    if (!_listenersRegistered) {
+        _listenersRegistered = YES;
         DLog("BLUEBUBBLESFACETIMEHELPER: Registering call listeners...");
-
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(callStatusChanged:) name:@"TUCallCenterVideoCallStatusChangedNotification" object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(callStatusChanged:) name:@"TUCallCenterCallStatusChangedNotification" object:nil];
-        
-        // [self handleMessage:controller message:@"{\"action\":\"invalidate-link\",\"transactionId\":\"bruh\",\"data\":{\"url\":\"https://facetime.apple.com/join#v=1&p=5rYoTVvAEe6LSjJziwUUiw&k=h9yNjziqokL3lLK-JEq-1_uae-KCvqKvayGsrkdNmGg\"}}"];
-    });
+    }
+}
+
+-(void) replayCurrentCallsToController:(NetworkController *)controller {
+    TUCallCenter *callCenter = [TUCallCenter sharedInstance];
+    if (callCenter == nil) return;
+    NSMutableArray<TUCall *> *calls = [NSMutableArray array];
+    if ([callCenter respondsToSelector:@selector(currentCalls)]) {
+        for (TUCall *call in [callCenter currentCalls]) {
+            if (call != nil && ![calls containsObject:call]) [calls addObject:call];
+        }
+    }
+    if ([callCenter respondsToSelector:@selector(incomingCalls)]) {
+        for (TUCall *call in [callCenter incomingCalls]) {
+            if (call != nil && ![calls containsObject:call]) [calls addObject:call];
+        }
+    }
+    NetworkController *target = controller ?: [NetworkController sharedInstance];
+    for (TUCall *call in calls) {
+        NSDictionary *data = [self callStatusPayloadForCall:call];
+        if (data != nil) {
+            [target sendMessage:@{@"event": @"ft-call-status-changed", @"data": data}];
+        }
+    }
 }
 
 -(void) callStatusChanged: (NSNotification *)notification {
@@ -233,11 +256,14 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
     if (![message isKindOfClass:[NSString class]] || message.length == 0) {
         return;
     }
-    // The data is in the form of a json string, so we need to convert it to a NSDictionary
-    // for some reason the data is sometimes duplicated, so account for that
+    // Split batched JSON objects delimited by }\n{ so no message is dropped.
     NSRange range = [message rangeOfString:@"}\n{"];
-    if(range.location != NSNotFound) {
-        message = [message substringWithRange:NSMakeRange(0, range.location + 1)];
+    if (range.location != NSNotFound) {
+        NSString *first = [message substringToIndex:range.location + 1];
+        NSString *rest = [message substringFromIndex:range.location + 2];
+        [self handleMessage:controller message:first];
+        [self handleMessage:controller message:rest];
+        return;
     }
     DLog("BLUEBUBBLESFACETIMEHELPER: Received raw json: %{public}@", message);
     NSError *error = nil;
@@ -269,18 +295,16 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
     if ([event isEqualToString:@"answer-call"]) {
         NSString *callUUID = BBExtractCallUUID(data);
         TUCall *call = BBFindCallByIdentifier([TUCallCenter sharedInstance], callUUID);
-        
-        if ([call callStatus] != 4) {
-            if (transaction != nil) {
-                [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"error": @"Call is not waiting to be answered!"}];
-            }
+
+        if (call == nil || [call callStatus] != 4) {
+            BBSendReply(replyController, transaction, @{
+                @"error": call == nil ? @"Call not found!" : @"Call is not waiting to be answered!"
+            });
             return;
         }
-        
+
         [[TUCallCenter sharedInstance] answerOrJoinCall:call];
-        if (transaction != nil) {
-            [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction}];
-        }
+        BBSendReply(replyController, transaction, nil);
     } else if ([event isEqualToString:@"leave-call"] || [event isEqualToString:@"decline-call"]) {
         NSString *callUUID = BBExtractCallUUID(data);
         TUCall *call = BBFindCallByIdentifier([TUCallCenter sharedInstance], callUUID);
@@ -353,7 +377,10 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         for (TUConversationLink* link in links) {
             NSMutableArray *handleArray = [NSMutableArray array];
             [[[link invitedMemberHandles] allObjects] enumerateObjectsUsingBlock:^(TUHandle* obj, NSUInteger idx, BOOL *stop) {
-                [handleArray addObject:[obj dictionaryRepresentation]];
+                NSDictionary *rep = [obj dictionaryRepresentation];
+                if (rep != nil) {
+                    [handleArray addObject:rep];
+                }
             }];
             NSDictionary* linkData = @{
                 @"url": [[link URL] absoluteString] ?: [NSNull null],
@@ -370,25 +397,46 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
     } else if ([event isEqualToString:@"invalidate-link"]) {
         TUConversationManager *manager = [self sharedConversationManager];
         NSArray<TUConversationLink*>* links = [[manager activatedConversationLinks] allObjects];
-        NSString *targetUrl = data[@"url"];
-        BOOL invalidated = NO;
-        void (^onDone)(char, NSError *) = ^(char arg0, NSError *arg1) {
-            BBSendReply(replyController, transaction, nil);
-        };
-        
-        for (TUConversationLink* link in links) {
-            if ([[[link URL] absoluteString] isEqualToString:targetUrl]) {
-                if ([manager respondsToSelector:@selector(invalidateLink:completionHandler:)]) {
-                    [manager invalidateLink:link completionHandler:onDone];
-                } else {
-                    [[[TUConversationManagerXPCClient alloc] init] invalidateLink:link completionHandler:onDone];
-                }
-                invalidated = YES;
+        NSString *targetUrl = BBNonEmptyString(data[@"url"]);
+        TUConversationLink *matchedLink = nil;
+        for (TUConversationLink *link in links) {
+            if (targetUrl != nil && [[[link URL] absoluteString] isEqualToString:targetUrl]) {
+                matchedLink = link;
                 break;
             }
         }
-        if (!invalidated) {
+        if (matchedLink == nil) {
             BBSendReply(replyController, transaction, @{@"error": @"Link not found to invalidate!"});
+            return;
+        }
+
+        __block BOOL replied = NO;
+        __block TUConversationManagerXPCClient *xpcClient = nil;
+        void (^finishReply)(NSDictionary *) = ^(NSDictionary *extra) {
+            if (replied) return;
+            replied = YES;
+            xpcClient = nil;
+            BBSendReply(replyController, transaction, extra);
+        };
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            finishReply(@{@"error": @"Timed out invalidating link!"});
+        });
+
+        void (^onDone)(char, NSError *) = ^(char arg0, NSError *arg1) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                finishReply(arg1 != nil ? @{@"error": arg1.localizedDescription ?: @"Failed to invalidate link!"} : nil);
+            });
+        };
+        if ([manager respondsToSelector:@selector(invalidateLink:completionHandler:)]) {
+            [manager invalidateLink:matchedLink completionHandler:onDone];
+        } else {
+            xpcClient = [[TUConversationManagerXPCClient alloc] init];
+            if (xpcClient != nil) {
+                [xpcClient invalidateLink:matchedLink completionHandler:onDone];
+            } else {
+                finishReply(@{@"error": @"Failed to invalidate link!"});
+            }
         }
     }
 }
@@ -396,6 +444,16 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
 @end
 
 #import "BlueBubblesFaceTimeHelper+Fork.inc"
+
+ZKSwizzleInterface(BBFT_NetworkController, NetworkController, NSObject)
+@implementation BBFT_NetworkController
+
+- (void)socket:(GCDAsyncSocket *)sock didConnectToHost:(NSString *)host port:(UInt16)port {
+    ZKOrig(void, sock, host, port);
+    [[BLUEBUBBLESFACETIMEHELPER sharedInstance] replayCurrentCallsToController:(NetworkController *)self];
+}
+
+@end
 
 
 //ZKSwizzleInterface(BBH_NSNotificationCenter, NSNotificationCenter, NSObject)

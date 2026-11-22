@@ -169,6 +169,37 @@
     }];
 }
 
+static void BBCountConversationParticipants(TUConversation *convo,
+                                            NSUInteger *outActiveRemote,
+                                            NSUInteger *outNonLightweight,
+                                            NSUInteger *outLightweight) {
+    NSUInteger activeRemoteCount = [convo respondsToSelector:@selector(activeRemoteParticipants)]
+        ? [[convo activeRemoteParticipants] count]
+        : 0;
+    NSUInteger activeNonLightweightCount = 0;
+    NSUInteger activeLightweightCount = [convo respondsToSelector:@selector(activeLightweightParticipants)]
+        ? [[convo activeLightweightParticipants] count]
+        : 0;
+    NSUInteger lightweightInRemote = 0;
+    if ([convo respondsToSelector:@selector(activeRemoteParticipants)]) {
+        for (id participant in [convo activeRemoteParticipants]) {
+            BOOL isLightweight = [participant respondsToSelector:@selector(isLightweight)] && [participant isLightweight];
+            BOOL isLocal = [participant respondsToSelector:@selector(isLocalAccountHandle)] && [participant isLocalAccountHandle];
+            if (isLightweight) {
+                lightweightInRemote++;
+            } else if (!isLocal) {
+                activeNonLightweightCount++;
+            }
+        }
+    }
+    if (activeLightweightCount == 0) {
+        activeLightweightCount = lightweightInRemote;
+    }
+    if (outActiveRemote) *outActiveRemote = activeRemoteCount;
+    if (outNonLightweight) *outNonLightweight = activeNonLightweightCount;
+    if (outLightweight) *outLightweight = activeLightweightCount;
+}
+
 - (NSDictionary *)callStatusPayloadForCall:(TUCall *)call {
     if (call == nil) return nil;
     id provider = [call respondsToSelector:@selector(provider)] ? [call provider] : nil;
@@ -190,22 +221,10 @@
     NSString *convGroupUUIDStr = [groupUUID UUIDString] ?: [[convo groupUUID] UUIDString];
     NSString *convUUIDStr = [convo respondsToSelector:@selector(UUID)] ? [[convo UUID] UUIDString] : nil;
     NSString *convLinkStr = [[[convo link] URL] absoluteString];
-    NSUInteger activeRemoteCount = [convo respondsToSelector:@selector(activeRemoteParticipants)] ? [[convo activeRemoteParticipants] count] : 0;
+    NSUInteger activeRemoteCount = 0;
     NSUInteger activeNonLightweightCount = 0;
-    NSUInteger activeLightweightCount = [convo respondsToSelector:@selector(activeLightweightParticipants)]
-        ? [[convo activeLightweightParticipants] count]
-        : 0;
-    if ([convo respondsToSelector:@selector(activeRemoteParticipants)]) {
-        for (id participant in [convo activeRemoteParticipants]) {
-            BOOL isLightweight = [participant respondsToSelector:@selector(isLightweight)] && [participant isLightweight];
-            BOOL isLocal = [participant respondsToSelector:@selector(isLocalAccountHandle)] && [participant isLocalAccountHandle];
-            if (isLightweight) {
-                if (activeLightweightCount == 0) activeLightweightCount++;
-            } else if (!isLocal) {
-                activeNonLightweightCount++;
-            }
-        }
-    }
+    NSUInteger activeLightweightCount = 0;
+    BBCountConversationParticipants(convo, &activeRemoteCount, &activeNonLightweightCount, &activeLightweightCount);
     NSUInteger remoteMembersCount = [convo respondsToSelector:@selector(remoteMembers)] ? [[convo remoteMembers] count] : 0;
     NSUInteger pendingMembersCount = [convo respondsToSelector:@selector(pendingMembers)] ? [[convo pendingMembers] count] : 0;
     BOOL convHasJoined = [convo respondsToSelector:@selector(hasJoined)] ? [convo hasJoined] : NO;
@@ -213,19 +232,46 @@
 
     NSString *resolvedCallUUID = BBResolvedCallUUID(call);
     NSString *uniqueProxyIdentifier = BBCallUniqueProxyIdentifier(call);
+    int callStatus = [call callStatus];
+    BOOL isOutgoing = [call isOutgoing];
+    int filteredOutReason = [call respondsToSelector:@selector(filteredOutReason)] ? [call filteredOutReason] : 0;
+    BOOL neverConnected = [call respondsToSelector:@selector(dateConnected)] ? ([call dateConnected] == nil) : YES;
+
+    static NSMutableSet<NSString *> *seenNonDisconnectedCalls = nil;
+    static dispatch_once_t seenOnce;
+    dispatch_once(&seenOnce, ^{
+        seenNonDisconnectedCalls = [[NSMutableSet alloc] init];
+    });
+    BOOL seenBefore = NO;
+    @synchronized(seenNonDisconnectedCalls) {
+        if (callStatus != 6) {
+            if ([seenNonDisconnectedCalls count] >= 512) {
+                [seenNonDisconnectedCalls removeAllObjects];
+            }
+            if (resolvedCallUUID != nil) [seenNonDisconnectedCalls addObject:resolvedCallUUID];
+            if (uniqueProxyIdentifier != nil) [seenNonDisconnectedCalls addObject:uniqueProxyIdentifier];
+        } else {
+            seenBefore = (resolvedCallUUID != nil && [seenNonDisconnectedCalls containsObject:resolvedCallUUID]) ||
+                         (uniqueProxyIdentifier != nil && [seenNonDisconnectedCalls containsObject:uniqueProxyIdentifier]);
+        }
+    }
+    BOOL isIncomingSilenced = (callStatus == 6) && !isOutgoing && neverConnected && !seenBefore;
+
     return @{
         @"audio_mode": [call audioMode] ?: [NSNull null],
-        @"call_status": @([call callStatus]),
+        @"call_status": @(callStatus),
         @"call_uuid": resolvedCallUUID ?: [NSNull null],
         @"unique_proxy_identifier": uniqueProxyIdentifier ?: [NSNull null],
         @"is_conversation": @([call isConversation]),
         @"disconnected_reason": @([call disconnectedReason]),
         @"ended_error": [call endedErrorString] ?: [NSNull null],
         @"ended_reason": [call endedReasonString] ?: [NSNull null],
+        @"filtered_out_reason": @(filteredOutReason),
+        @"is_incoming_silenced": @(isIncomingSilenced),
         @"handle": [[call handle] dictionaryRepresentation] ?: [NSNull null],
         @"is_sending_audio": @([call isSendingAudio]),
         @"is_sending_video": @([call isSendingVideo]),
-        @"is_outgoing": @([call isOutgoing]),
+        @"is_outgoing": @(isOutgoing),
         @"is_video": @(isVideo),
         @"is_telephony": @(isTelephony),
         @"provider_identifier": providerIdentifier ?: [NSNull null],
@@ -278,9 +324,15 @@
         }];
     }
 
+    NSUInteger activeRemoteCount = 0;
+    NSUInteger activeNonLightweightCount = 0;
+    NSUInteger activeLightweightCount = 0;
+    BBCountConversationParticipants(convo, &activeRemoteCount, &activeNonLightweightCount, &activeLightweightCount);
+
     return @{
         @"uuid": [[convo UUID] UUIDString] ?: [NSNull null],
         @"groupUUID": [[convo groupUUID] UUIDString] ?: [NSNull null],
+        @"link": [[[convo link] URL] absoluteString] ?: [NSNull null],
         @"state": @([convo state]),
         @"pendingConversation": @([convo isPendingConversation]),
         @"hasJoined": @([convo hasJoined]),
@@ -288,7 +340,9 @@
         @"letMeInRequestState": @([convo letMeInRequestState]),
         @"pendingMemberCount": @([[convo pendingMembers] count]),
         @"remoteMemberCount": @([[convo remoteMembers] count]),
-        @"activeRemoteParticipantCount": @([[convo activeRemoteParticipants] count]),
+        @"activeRemoteParticipantCount": @(activeRemoteCount),
+        @"activeLightweightParticipantCount": @(activeLightweightCount),
+        @"activeNonLightweightParticipantCount": @(activeNonLightweightCount),
         @"pendingMembers": pendingMembers,
     };
 }
@@ -314,16 +368,29 @@
         return YES;
     } else if ([event isEqualToString:@"admit-any-pending-member"]) {
         TUConversationManager *manager = [self sharedConversationManager];
+        NSString *targetConvUUID = BBNonEmptyString(data[@"conversationUUID"]) ?: BBNonEmptyString(data[@"groupUUID"]);
         NSMutableArray *admittedMembers = [[NSMutableArray alloc] init];
+        NSMutableArray<NSString *> *admittedParticipants = [[NSMutableArray alloc] init];
 
         for (TUConversation *convo in [self conversationCandidatesForManager:manager]) {
+            if (targetConvUUID != nil) {
+                NSString *cGroupUUID = [[convo groupUUID] UUIDString];
+                NSString *cUUID = [convo respondsToSelector:@selector(UUID)] ? [[convo UUID] UUIDString] : nil;
+                BOOL matchesGroup = cGroupUUID != nil && [cGroupUUID caseInsensitiveCompare:targetConvUUID] == NSOrderedSame;
+                BOOL matchesUUID = cUUID != nil && [cUUID caseInsensitiveCompare:targetConvUUID] == NSOrderedSame;
+                if (!matchesGroup && !matchesUUID) continue;
+            }
             for (TUConversationMember *member in [convo pendingMembers]) {
                 DLog("BLUEBUBBLESFACETIMEHELPER: approving pending member %{public}@", member);
                 [manager approvePendingMember:member forConversation:convo];
+                NSString *handleUUID = BBNonEmptyString([[[member handle] value] description]);
                 [admittedMembers addObject:@{
                     @"conversationUUID": [[convo groupUUID] UUIDString] ?: [NSNull null],
-                    @"handleUUID": [[[member handle] value] description] ?: [NSNull null],
+                    @"handleUUID": handleUUID ?: [NSNull null],
                 }];
+                if (handleUUID != nil && ![admittedParticipants containsObject:handleUUID]) {
+                    [admittedParticipants addObject:handleUUID];
+                }
             }
         }
 
@@ -331,6 +398,7 @@
             @"data": @{
                 @"admittedCount": @([admittedMembers count]),
                 @"admittedMembers": admittedMembers,
+                @"admittedParticipants": admittedParticipants,
             },
         });
         return YES;
