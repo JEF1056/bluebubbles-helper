@@ -67,6 +67,37 @@
 - (void)editMessageItem:(id)arg1 atPartIndex:(long)arg2 withNewPartText:(id)arg3 newPartTranslation:(id)arg4 backwardCompatabilityText:(id)arg5;
 @end
 
+@interface IMChat (MacOS27)
+- (NSString *)lastAddressedHandleID;
+@end
+
+@interface IMNicknameController (MacOS27)
+- (void)allowHandlesForNicknameSharing:(id)handles forChat:(id)chat fromHandle:(id)fromHandle forceSend:(BOOL)forceSend;
+- (void)updateLocalNicknameStore;
+@end
+
+@interface IMPinnedConversationsController (MacOS27)
+@property (nonatomic, retain) NSDictionary *chatMetadata;
+- (id)_metadataDictionaryForChat:(id)chat;
+- (void)_setPinnedConversationIdentifiers:(id)identifiers withChatMetadata:(id)chatMetadata updateReason:(id)reason shouldUpdateStores:(BOOL)shouldUpdateStores;
+- (void)setPinnedChats:(id)chats withUpdateReason:(id)reason;
+@end
+
+@interface IMNickname (MacOS27)
+- (instancetype)initWithFirstName:(id)firstName lastName:(id)lastName avatar:(id)avatar pronouns:(id)pronouns;
+@end
+
+@interface IMNicknameAvatarImage (MacOS27)
+- (instancetype)initWithImageName:(id)imageName imageData:(id)imageData imageFilePath:(id)imageFilePath sensitivityAnalysis:(id)sensitivityAnalysis error:(NSError **)error;
+- (instancetype)initWithImageName:(id)imageName imageFilePath:(id)imageFilePath sensitivityAnalysis:(id)sensitivityAnalysis;
+@end
+
+@interface IMMessageItem (MacOS27)
+- (BOOL)isIncomingTypingMessage;
+- (BOOL)isIncomingTypingOrCancelTypingMessage;
+- (BOOL)isCancelTypingMessage;
+@end
+
 @interface BlueBubblesHelper (Fork)
 - (NSArray<NSString *> *)getPinnedChatGuids;
 - (BOOL)handleForkServerEvent:(NSString *)event data:(NSDictionary *)data transaction:(NSString *)transaction;
@@ -466,9 +497,23 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
             }
             NSInteger partIndex = [data[@"partIndex"] integerValue];
             dispatch_async(dispatch_get_main_queue(), ^{
-                [chat retractMessagePart:BBMessagePartForIndex(message, partIndex, NO)];
-                if (transaction != nil) {
-                    SendTransactionResponse(transaction, nil);
+                IMMessagePartChatItem *part = BBMessagePartForIndex(message, partIndex, NO);
+                if (part == nil) {
+                    if (transaction != nil) {
+                        SendTransactionResponse(transaction, @{@"error": @"Message part not found"});
+                    }
+                    return;
+                }
+                @try {
+                    [chat retractMessagePart:part];
+                    if (transaction != nil) {
+                        SendTransactionResponse(transaction, nil);
+                    }
+                } @catch (NSException *exception) {
+                    DLog("BLUEBUBBLESHELPER: Failed to unsend message part: %@", exception);
+                    if (transaction != nil) {
+                        SendTransactionResponse(transaction, @{@"error": exception.reason ?: @"Failed to unsend message"});
+                    }
                 }
             });
         }];
@@ -647,8 +692,17 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     // If the server wants to get media for a balloon bundle item
     } else if ([event isEqualToString:@"balloon-bundle-media-path"]) {
         IMChat *chat = [self getIMChatFromGuid: data[@"chatGuid"] transaction: transaction];
+        if (chat == nil) {
+            return;
+        }
 
         [BlueBubblesHelper getMessageItem:(chat) :(data[@"messageGuid"]) completionBlock:^(IMMessage *message) {
+            if (message == nil) {
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, @{@"error": @"Message not found"});
+                }
+                return;
+            }
             IMMessageItem *messageItem = (IMMessageItem *)message._imMessageItem;
             NSObject *items = messageItem._newChatItems;
             // balloon items will only be an IMTranscriptPluginChatItem
@@ -658,7 +712,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                 // The data source is this weird class, no idea what framework its from. Class methods dumped via _methodDescription on cls
                 Class digitalTouchClass = NSClassFromString(@"ETiOSMacBalloonPluginDataSource");
                 Class handwrittenClass = NSClassFromString(@"HWiOSMacBalloonDataSource");
-                if ([temp isKindOfClass:digitalTouchClass]) {
+                if (digitalTouchClass != nil && [temp isKindOfClass:digitalTouchClass]) {
                     ETiOSMacBalloonPluginDataSource *digitalTouch = (ETiOSMacBalloonPluginDataSource *)[item dataSource];
                     // Force iMessage to generate the .mov and return the path
                     [digitalTouch generateMedia:^() {
@@ -668,7 +722,7 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                             [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"path": path ?: [NSNull null]}];
                         }
                     }];
-                } else if ([temp isKindOfClass:handwrittenClass]) {
+                } else if (handwrittenClass != nil && [temp isKindOfClass:handwrittenClass]) {
                     HWiOSMacBalloonDataSource *digitalTouch = (HWiOSMacBalloonDataSource *)[item dataSource];
                     CGSize size = [digitalTouch sizeThatFits:CGSizeMake(300, 300)];
                     [digitalTouch generateImageForSize:size completionHandler:^(NSObject *url) {
@@ -678,12 +732,23 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                             [[NetworkController sharedInstance] sendMessage: @{@"transactionId": transaction, @"path": path ?: [NSNull null]}];
                         }
                     }];
+                } else {
+                    if (transaction != nil) {
+                        SendTransactionResponse(transaction, @{@"error": @"Unsupported balloon bundle data source"});
+                    }
+                }
+            } else {
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, @{@"error": @"Message is not a balloon bundle item"});
                 }
             }
         }];
     // If the server requests us to update the group photo
     } else if ([event isEqualToString:@"update-group-photo"]) {
         IMChat *chat = [self getIMChatFromGuid: data[@"chatGuid"] transaction: transaction];
+        if (chat == nil) {
+            return;
+        }
         if (data[@"filePath"] != [NSNull null] && [data[@"filePath"] length] != 0) {
             NSURL * fileUrl = [NSURL fileURLWithPath: data[@"filePath"]];
             IMFileTransfer* fileTransfer = [BlueBubblesHelper prepareFileTransferForAttachment:fileUrl filename:[fileUrl lastPathComponent]];
@@ -739,8 +804,17 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
         }
     } else if ([event isEqualToString:@"notify-anyways"]) {
         IMChat *chat = [self getIMChatFromGuid:data[@"chatGuid"] transaction: transaction];
+        if (chat == nil) {
+            return;
+        }
 
         [BlueBubblesHelper getMessageItem:(chat) :(data[@"messageGuid"]) completionBlock:^(IMMessage *message) {
+            if (message == nil) {
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, @{@"error": @"Message not found"});
+                }
+                return;
+            }
             IMMessageItem *messageItem = (IMMessageItem *)message._imMessageItem;
             NSObject *items = messageItem._newChatItems;
             IMMessagePartChatItem *item;
@@ -755,6 +829,10 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
                 [chat markChatItemAsNotifyRecipient:item];
                 if (transaction != nil) {
                     SendTransactionResponse(transaction, nil);
+                }
+            } else {
+                if (transaction != nil) {
+                    SendTransactionResponse(transaction, @{@"error": @"Message part not found"});
                 }
             }
         }];
@@ -816,6 +894,9 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     // If the server asks us if the chat can have a nickname shared
     } else if ([event isEqualToString:@"should-offer-nickname-sharing"]) {
         IMChat *chat = [self getIMChatFromGuid:data[@"chatGuid"] transaction: transaction];
+        if (chat == nil) {
+            return;
+        }
 
         BOOL offer = [[IMNicknameController sharedInstance] shouldOfferNicknameSharingForChat:chat];
         if (transaction != nil) {
@@ -824,11 +905,22 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     // If the server tells us to share a nickname
     } else if ([event isEqualToString:@"share-nickname"]) {
         IMChat *chat = [self getIMChatFromGuid:data[@"chatGuid"] transaction: transaction];
+        if (chat == nil) {
+            return;
+        }
 
-        if ([[NSProcessInfo processInfo] operatingSystemVersion].majorVersion >= 11) {
-            [[IMNicknameController sharedInstance] whitelistHandlesForNicknameSharing:[chat participants] forChat:chat];
-        } else {
-            [[IMNicknameController sharedInstance] allowHandlesForNicknameSharing:[chat participants] forChat:chat];
+        IMNicknameController *controller = [IMNicknameController sharedInstance];
+        NSArray *participants = [chat participants];
+        if ([controller respondsToSelector:@selector(allowHandlesForNicknameSharing:forChat:fromHandle:forceSend:)]) {
+            NSString *fromHandle = [chat respondsToSelector:@selector(lastAddressedHandleID)] ? [chat lastAddressedHandleID] : nil;
+            [controller allowHandlesForNicknameSharing:participants forChat:chat fromHandle:fromHandle forceSend:YES];
+        } else if ([[NSProcessInfo processInfo] operatingSystemVersion].majorVersion >= 11 &&
+                   [controller respondsToSelector:@selector(whitelistHandlesForNicknameSharing:forChat:)]) {
+            [controller whitelistHandlesForNicknameSharing:participants forChat:chat];
+        } else if ([controller respondsToSelector:@selector(allowHandlesForNicknameSharing:forChat:)]) {
+            [controller allowHandlesForNicknameSharing:participants forChat:chat];
+        } else if ([controller respondsToSelector:@selector(whitelistHandlesForNicknameSharing:forChat:)]) {
+            [controller whitelistHandlesForNicknameSharing:participants forChat:chat];
         }
         if (transaction != nil) {
             SendTransactionResponse(transaction, nil);
@@ -1356,25 +1448,49 @@ static IMMessagePartChatItem *BBMessagePartForIndex(IMMessage *message, NSIntege
     // attributes.displayName -> Group Chat Name (null if none)
     // Leaving empty unless we want something specific...
     queryContext.fetchAttributes = @[];
+    static NSMutableSet<CSSearchQuery *> *activeSearchQueries = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        activeSearchQueries = [[NSMutableSet alloc] init];
+    });
+
     CSSearchQuery *query = [[CSSearchQuery alloc] initWithQueryString:queryString queryContext:queryContext];
+    @synchronized(activeSearchQueries) {
+        [activeSearchQueries addObject:query];
+    }
 
     NSMutableArray<NSString *> *results = [NSMutableArray array];
     query.foundItemsHandler = ^(NSArray<CSSearchableItem *> * _Nonnull items) {
-        for (CSSearchableItem *item in items) {
-            // Add the unique identifier to the results array
-            [results addObject:item.uniqueIdentifier];
+        @synchronized(results) {
+            for (CSSearchableItem *item in items) {
+                // Add the unique identifier to the results array
+                if (item.uniqueIdentifier != nil) {
+                    [results addObject:item.uniqueIdentifier];
+                }
+            }
         }
     };
     
+    __weak CSSearchQuery *weakQuery = query;
     query.completionHandler = ^(NSError * _Nullable error) {
+        CSSearchQuery *strongQuery = weakQuery;
+        if (strongQuery != nil) {
+            @synchronized(activeSearchQueries) {
+                [activeSearchQueries removeObject:strongQuery];
+            }
+        }
         if (error) {
             DLog("BLUEBUBBLESHELPER: Message search error: %@", error.localizedDescription);
             if (onError) {
                 onError(error.localizedDescription);
             }
         } else {
+            NSArray<NSString *> *resultsCopy = nil;
+            @synchronized(results) {
+                resultsCopy = [results copy];
+            }
             if (onComplete) {
-                onComplete([results copy]);
+                onComplete((NSMutableArray<NSString *> *)resultsCopy);
             }
         }
     };
@@ -1436,13 +1552,20 @@ ZKSwizzleInterface(BBH_IMChat, IMChat, NSObject)
     NSString *guid = (NSString *)ZKHookIvar(self, NSString*, "_guid");
     if (guid != nil) {
         // check if incoming item is a typing indicator or not, and update the status accordingly. check if the class responds to the selector to avoid crashes
-        if ([item respondsToSelector:@selector(isIncomingTypingMessage)] && [item isIncomingTypingMessage]) {
+        BOOL isIncomingTyping = NO;
+        if ([item respondsToSelector:@selector(isIncomingTypingMessage)]) {
+            isIncomingTyping = [item isIncomingTypingMessage];
+        } else if ([item respondsToSelector:@selector(isIncomingTypingOrCancelTypingMessage)] &&
+                   [item respondsToSelector:@selector(isCancelTypingMessage)]) {
+            isIncomingTyping = [item isIncomingTypingOrCancelTypingMessage] && ![item isCancelTypingMessage];
+        }
+        if (isIncomingTyping) {
             [[NetworkController sharedInstance] sendMessage: @{@"event": @"started-typing", @"guid": guid}];
             DLog("BLUEBUBBLESHELPER: %{public}@ started typing", guid);
         } else if ([item respondsToSelector:@selector(isCancelTypingMessage)] && [item isCancelTypingMessage]) {
             [[NetworkController sharedInstance] sendMessage: @{@"event": @"stopped-typing", @"guid": guid}];
             DLog("BLUEBUBBLESHELPER: %{public}@ stopped typing", guid);
-        } else if ([item respondsToSelector:@selector(isTypingMessage)] && [[item message] isTypingMessage] == NO) {
+        } else if ([item respondsToSelector:@selector(isTypingMessage)] && ![item isTypingMessage] && [[item message] isTypingMessage] == NO) {
             [[NetworkController sharedInstance] sendMessage: @{@"event": @"stopped-typing", @"guid": guid}];
             DLog("BLUEBUBBLESHELPER: %{public}@ stopped typing", guid);
         }

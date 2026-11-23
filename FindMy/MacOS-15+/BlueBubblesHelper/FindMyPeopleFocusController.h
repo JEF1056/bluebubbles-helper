@@ -15,6 +15,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)focusPeopleTabAndSelectTargets:(NSArray<NSString *> *)targets
                          inRootObjects:(nullable NSArray *)rootObjects;
 
+- (nullable id)discoverMediatorInRootObjects:(nullable NSArray *)rootObjects;
+- (BOOL)startFMFLiveLocationForTargets:(NSArray<NSString *> *)targets;
+- (BOOL)stopFMFLiveLocationForTargets:(NSArray<NSString *> *)targets;
+- (BOOL)keepaliveFMFLiveLocationForTargets:(NSArray<NSString *> *)targets;
+- (BOOL)triggerFMFShallowRefresh;
+
 + (BOOL)string:(nullable NSString *)candidate matchesTarget:(nullable NSString *)target;
 
 @end

@@ -7,7 +7,7 @@ DYLIB_NAME="BlueBubblesCameraHook.dylib"
 BUILD_DIR="$DIR/build"
 mkdir -p "$BUILD_DIR" "$OUT_DIR"
 
-FRAMEWORKS="-framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Foundation -framework VideoToolbox"
+FRAMEWORKS="-framework AVFoundation -framework AudioToolbox -framework CoreAudio -framework CoreMedia -framework CoreVideo -framework Foundation -framework VideoToolbox"
 CFLAGS="-fobjc-arc -O2 -Wall -Wextra -Wno-unused-parameter"
 
 for ARCH in x86_64 arm64 arm64e; do

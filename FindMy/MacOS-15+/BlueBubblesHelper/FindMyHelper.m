@@ -44,6 +44,7 @@ static const long long BBLiveLocationRefreshPriority = 2;
 @property(nonatomic, copy, nullable) NSString *pendingLiveNormalizedIdentifier;
 @property(nonatomic, strong, nullable) id activeLiveHandleObject;
 @property(nonatomic, copy, nullable) NSArray<NSString *> *activeLiveFocusTargets;
+@property(nonatomic, copy, nullable) NSArray<NSString *> *activeLiveFMFTargets;
 @property(nonatomic, strong, nullable) dispatch_source_t liveKeepaliveTimer;
 @property(nonatomic, strong, nullable) id<NSObject> liveActivityToken;
 @property(nonatomic) NSUInteger liveSessionGeneration;
@@ -463,7 +464,11 @@ static os_log_t helperLog;
 
 - (void)stopLiveRefreshForHandleObject:(id)handleObject
                   normalizedIdentifier:(nullable NSString *)normalizedIdentifier
+                            fmfTargets:(nullable NSArray<NSString *> *)fmfTargets
                                session:(nullable FindMyLocateSession *)session {
+    if (fmfTargets.count > 0) {
+        [[FindMyPeopleFocusController sharedInstance] stopFMFLiveLocationForTargets:fmfTargets];
+    }
     if (normalizedIdentifier != nil) {
         @synchronized (self.inFlightRefreshHandleCounts) {
             [self.inFlightRefreshHandleCounts removeObjectForKey:normalizedIdentifier];
@@ -547,9 +552,14 @@ static os_log_t helperLog;
             ![self.activeLiveNormalizedIdentifier isEqualToString:normalizedTarget]) {
             id priorHandle = self.activeLiveHandleObject;
             NSString *priorIdentifier = self.activeLiveNormalizedIdentifier;
+            NSArray<NSString *> *priorFMFTargets = self.activeLiveFMFTargets;
             self.activeLiveHandleObject = nil;
             self.activeLiveNormalizedIdentifier = nil;
-            [self stopLiveRefreshForHandleObject:priorHandle normalizedIdentifier:priorIdentifier session:session];
+            self.activeLiveFMFTargets = nil;
+            [self stopLiveRefreshForHandleObject:priorHandle
+                            normalizedIdentifier:priorIdentifier
+                                      fmfTargets:priorFMFTargets
+                                         session:session];
         }
 
         __weak typeof(self) weakSelf = self;
@@ -627,6 +637,22 @@ static os_log_t helperLog;
                 [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:resolvedTargets];
             }
             strongSelf.activeLiveFocusTargets = resolvedTargets;
+            strongSelf.activeLiveFMFTargets = resolvedTargets;
+            BOOL fmfLiveStarted = [[FindMyPeopleFocusController sharedInstance] startFMFLiveLocationForTargets:resolvedTargets];
+            if (!fmfLiveStarted && NSClassFromString(@"UIApplication") != Nil) {
+                // Retry once shortly in case FMFDataManager is still hydrating on cold FindMy launch.
+                dispatch_after(
+                    dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                    dispatch_get_main_queue(),
+                    ^{
+                        FindMyHelper *retrySelf = weakSelf;
+                        if (retrySelf == nil || retrySelf.liveSessionGeneration != sessionGen) {
+                            return;
+                        }
+                        [[FindMyPeopleFocusController sharedInstance] keepaliveFMFLiveLocationForTargets:resolvedTargets];
+                    }
+                );
+            }
             [strongSelf startLiveKeepaliveTimerForGeneration:sessionGen];
 
             [strongSelf sendTransactionResponse:transactionIdentifier payload:@{
@@ -662,12 +688,17 @@ static os_log_t helperLog;
         [self stopLiveKeepaliveTimer];
         id handleToStop = self.activeLiveHandleObject;
         NSString *stoppedIdentifier = currentLiveIdentifier ?: normalizedTarget;
+        NSArray<NSString *> *fmfTargetsToStop = self.activeLiveFMFTargets;
         self.activeLiveHandleObject = nil;
         self.activeLiveNormalizedIdentifier = nil;
         self.pendingLiveNormalizedIdentifier = nil;
         self.activeLiveFocusTargets = nil;
+        self.activeLiveFMFTargets = nil;
 
-        [self stopLiveRefreshForHandleObject:handleToStop normalizedIdentifier:stoppedIdentifier session:session];
+        [self stopLiveRefreshForHandleObject:handleToStop
+                        normalizedIdentifier:stoppedIdentifier
+                                  fmfTargets:fmfTargetsToStop
+                                     session:session];
         [self restoreFocusConditionsIfIdle];
 
         [self sendTransactionResponse:transactionIdentifier payload:@{
@@ -697,10 +728,19 @@ static os_log_t helperLog;
         }
         NSArray<NSString *> *focusTargets = [self focusTargetsFromData:data];
         BOOL targetedOnly = focusedHandle != nil || focusTargets.count > 0;
+        NSString *normalizedFocusKey = focusedHandle.lowercaseString;
+        BOOL isAlreadyLive = normalizedFocusKey != nil &&
+            ([normalizedFocusKey isEqualToString:self.activeLiveNormalizedIdentifier] ||
+             [normalizedFocusKey isEqualToString:self.pendingLiveNormalizedIdentifier]);
+        __block BOOL startedTemporaryFMFLive = NO;
         if (targetedOnly && focusTargets.count > 0) {
             [[FindMyPeopleFocusController sharedInstance] scheduleFocusPeopleTabAndSelectTargets:focusTargets];
+            if (!isAlreadyLive) {
+                startedTemporaryFMFLive = [[FindMyPeopleFocusController sharedInstance] startFMFLiveLocationForTargets:focusTargets];
+            }
+        } else if (!targetedOnly) {
+            [[FindMyPeopleFocusController sharedInstance] triggerFMFShallowRefresh];
         }
-        NSString *normalizedFocusKey = focusedHandle.lowercaseString;
         [self adjustInFlightRefreshCountForIdentifier:normalizedFocusKey delta:1];
 
         NSUInteger generation = self.connectionGeneration;
@@ -717,6 +757,10 @@ static os_log_t helperLog;
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [[ServerConnection sharedInstance] sendMessage:response];
                     FindMyHelper *strongSelf = weakSelf;
+                    if (startedTemporaryFMFLive &&
+                        (weakCoordinator == nil || !weakCoordinator.preserveFocusedLiveRefresh)) {
+                        [[FindMyPeopleFocusController sharedInstance] stopFMFLiveLocationForTargets:focusTargets];
+                    }
                     if (strongSelf != nil) {
                         [strongSelf adjustInFlightRefreshCountForIdentifier:normalizedFocusKey delta:-1];
                         if (weakCoordinator != nil) {
@@ -731,9 +775,7 @@ static os_log_t helperLog;
                     }
                 });
             }];
-        if (normalizedFocusKey != nil &&
-            ([normalizedFocusKey isEqualToString:self.activeLiveNormalizedIdentifier] ||
-             [normalizedFocusKey isEqualToString:self.pendingLiveNormalizedIdentifier])) {
+        if (isAlreadyLive) {
             coordinator.preserveFocusedLiveRefresh = YES;
         }
         weakCoordinator = coordinator;
@@ -764,7 +806,8 @@ static os_log_t helperLog;
             activePollInterval:BBDevicesActiveRefreshPollIntervalSeconds
             dataSourceProvider:^id _Nullable {
                 [dataSourceCapture installCapture];
-                return dataSourceCapture.devicesDataSource;
+                return dataSourceCapture.devicesDataSource
+                    ?: [[FindMyPeopleFocusController sharedInstance] discoverMediatorInRootObjects:nil];
             }
             snapshotProvider:^NSDictionary *(id dataSource) {
                 return [FindMyDeviceSnapshotBridge snapshotForDataSource:dataSource];
@@ -796,8 +839,10 @@ static os_log_t helperLog;
                             shouldRestoreThrottle = (strongSelf.activeForcedDeviceRefreshCount == 0);
                         }
                     }
-                    if (shouldRestoreThrottle && dataSourceCapture.devicesDataSource != nil) {
-                        void *managerPtr = BlueBubblesFindMyCopyFMIPManager((__bridge void *)dataSourceCapture.devicesDataSource);
+                    id devicesRoot = dataSourceCapture.devicesDataSource
+                        ?: [[FindMyPeopleFocusController sharedInstance] discoverMediatorInRootObjects:nil];
+                    if (shouldRestoreThrottle && devicesRoot != nil) {
+                        void *managerPtr = BlueBubblesFindMyCopyFMIPManager((__bridge void *)devicesRoot);
                         if (managerPtr != NULL) {
                             id manager = CFBridgingRelease(managerPtr);
                             [FindMyDevicesRefreshCoordinator restoreFMIPManagerRefreshThrottle:manager];
@@ -820,12 +865,15 @@ static os_log_t helperLog;
     [self stopLiveKeepaliveTimer];
     id handleToStop = self.activeLiveHandleObject;
     NSString *stoppedIdentifier = self.activeLiveNormalizedIdentifier ?: self.pendingLiveNormalizedIdentifier;
+    NSArray<NSString *> *fmfTargetsToStop = self.activeLiveFMFTargets;
     self.activeLiveHandleObject = nil;
     self.activeLiveNormalizedIdentifier = nil;
     self.pendingLiveNormalizedIdentifier = nil;
     self.activeLiveFocusTargets = nil;
+    self.activeLiveFMFTargets = nil;
     [self stopLiveRefreshForHandleObject:handleToStop
                     normalizedIdentifier:stoppedIdentifier
+                              fmfTargets:fmfTargetsToStop
                                  session:self.activeLocateSession];
 }
 
@@ -857,10 +905,12 @@ static os_log_t helperLog;
             [strongSelf stopLiveKeepaliveTimer];
             return;
         }
-        // Keep the person selected in FindMy.app and visibility flags active so FindMy keeps acquiring accurate fixes.
+        // Keep the person selected in FindMy.app, visibility flags active, and FMFCore live session alive.
         if (strongSelf.activeLiveFocusTargets.count > 0) {
             [[FindMyPeopleFocusController sharedInstance]
                 scheduleFocusPeopleTabAndSelectTargets:strongSelf.activeLiveFocusTargets];
+            [[FindMyPeopleFocusController sharedInstance]
+                keepaliveFMFLiveLocationForTargets:strongSelf.activeLiveFocusTargets];
         }
         FindMyLocateSession *session = strongSelf.activeLocateSession;
         if (session != nil) {

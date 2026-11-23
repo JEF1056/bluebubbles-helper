@@ -1,11 +1,15 @@
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
+#import <CoreAudio/CoreAudio.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <mach/mach_time.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <os/lock.h>
+#import <os/log.h>
 #import <stdatomic.h>
 #import <stdbool.h>
 #import <stdint.h>
@@ -15,11 +19,15 @@
 #import <fcntl.h>
 #import <unistd.h>
 
-#define BB_RING_PATH "/private/tmp/FaceTime/bb-camera.ring"
+#define BB_RING_PATH "/private/var/tmp/AVConference/bb-camera.ring"
+#define BB_DOWNLINK_RING_PATH "/private/var/tmp/AVConference/bb-downlink.ring"
+#define BB_CAMERA_ACTIVE_PATH "/private/var/tmp/AVConference/bb-camera.active"
 #define BB_RING_MAGIC 0x42424352u // 'BBCR'
 #define BB_RING_VERSION 1u
-#define BB_RING_MAX_WIDTH 1280u
-#define BB_RING_MAX_HEIGHT 720u
+#define BB_RING_MAX_DIM 1920u
+#define BB_RING_MAX_PIXELS (1920u * 1080u)
+#define BB_DOWNLINK_RING_SLOTS 3u
+#define BB_DOWNLINK_SLOT_BYTES (1920u * 1080u * 3u / 2u)
 #define BB_RING_STALE_NS 500000000ULL // 500 ms
 #define BB_RING_TEARDOWN_STALE_NS 3000000000ULL // 3 s
 #define BB_RING_LSTAT_INTERVAL_NS 200000000ULL // 200 ms
@@ -35,7 +43,9 @@ typedef struct {
     uint64_t ts_ns;
     uint32_t slots;
     uint32_t slot_bytes;
-    uint8_t reserved[16];
+    uint32_t orientation; // VideoAttributes orientation (0=Portrait, 1=PortraitUpsideDown, 2=LandscapeLeft, 3=LandscapeRight)
+    uint32_t flags;       // bit 0: orientation is valid
+    uint8_t reserved[8];
 } BBCameraRingHeader;
 
 _Static_assert(sizeof(BBCameraRingHeader) == 64, "BBCameraRingHeader must be 64 bytes");
@@ -71,6 +81,21 @@ typedef struct {
 
 static os_unfair_lock g_reader_lock = OS_UNFAIR_LOCK_INIT;
 static BBCameraRingReader g_reader = {.fd = -1};
+static const char *g_ringPath = BB_RING_PATH;
+static const char *g_activeFlagPath = BB_CAMERA_ACTIVE_PATH;
+static const char *g_downlinkRingPath = BB_DOWNLINK_RING_PATH;
+
+void BBCameraHookSetRingPathForTesting(const char *path) {
+    g_ringPath = path ? path : BB_RING_PATH;
+}
+
+void BBCameraHookSetActiveFlagPathForTesting(const char *path) {
+    g_activeFlagPath = path ? path : BB_CAMERA_ACTIVE_PATH;
+}
+
+void BBCameraHookSetDownlinkRingPathForTesting(const char *path) {
+    g_downlinkRingPath = path ? path : BB_DOWNLINK_RING_PATH;
+}
 
 static void bb_reader_unmap(BBCameraRingReader *r) {
     if (r->map && r->map != MAP_FAILED) {
@@ -171,16 +196,14 @@ static bool bb_ensure_mapped(BBCameraRingReader *r, const char *path, uint64_t n
     return true;
 }
 
-CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSampleBuffer, const char *ringPath) {
-    if (!origSampleBuffer || !ringPath) return NULL;
-
-    CVImageBufferRef origImg = CMSampleBufferGetImageBuffer(origSampleBuffer);
-    if (!origImg) return NULL;
-
-    uint32_t dstW = (uint32_t)CVPixelBufferGetWidth(origImg);
-    uint32_t dstH = (uint32_t)CVPixelBufferGetHeight(origImg);
-    OSType dstFmt = CVPixelBufferGetPixelFormatType(origImg);
-    if (dstW == 0 || dstH == 0) return NULL;
+CMSampleBufferRef BBCameraHookCreateSampleBufferFromRing(
+    uint32_t dstW,
+    uint32_t dstH,
+    OSType dstFmt,
+    const CMSampleTimingInfo *timing,
+    const char *ringPath)
+{
+    if (!timing || !ringPath) return NULL;
 
     uint64_t now_ns = bb_now_ns();
 
@@ -209,7 +232,8 @@ CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSa
     uint64_t ts_ns = hdr->ts_ns;
 
     if (magic != BB_RING_MAGIC || version != BB_RING_VERSION ||
-        w == 0 || w > BB_RING_MAX_WIDTH || h == 0 || h > BB_RING_MAX_HEIGHT ||
+        w == 0 || w > BB_RING_MAX_DIM || h == 0 || h > BB_RING_MAX_DIM ||
+        (uint64_t)w * (uint64_t)h > BB_RING_MAX_PIXELS ||
         (w & 1u) != 0 || (h & 1u) != 0 ||
         stride < w || fmt != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
         slots == 0 || slots > 16 ||
@@ -227,6 +251,14 @@ CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSa
         return NULL;
     }
 
+    if (dstW == 0 || dstH == 0) {
+        dstW = w;
+        dstH = h;
+    }
+    if (dstFmt == 0) {
+        dstFmt = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    }
+
     if (!g_reader.src_pool || g_reader.src_w != w || g_reader.src_h != h) {
         if (g_reader.src_pool) CFRelease(g_reader.src_pool);
         g_reader.src_pool = bb_create_pool(w, h, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
@@ -241,7 +273,9 @@ CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSa
         g_reader.dst_fmt = dstFmt;
     }
     if (!g_reader.transfer_session) {
-        VTPixelTransferSessionCreate(kCFAllocatorDefault, &g_reader.transfer_session);
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &g_reader.transfer_session) == noErr && g_reader.transfer_session) {
+            VTSessionSetProperty(g_reader.transfer_session, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Letterbox);
+        }
     }
 
     if (!g_reader.src_pool || !g_reader.dst_pool || !g_reader.transfer_session) {
@@ -292,6 +326,11 @@ CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSa
         return NULL;
     }
 
+    // Tag source 420v buffer with Rec.709 color-space attachments so VTPixelTransfer + formatDesc preserve them
+    CVBufferSetAttachment(srcBuf, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(srcBuf, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(srcBuf, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+
     CVPixelBufferRef dstBuf = NULL;
     if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_reader.dst_pool, &dstBuf) != kCVReturnSuccess || !dstBuf) {
         CFRelease(srcBuf);
@@ -314,15 +353,8 @@ CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSa
         return NULL;
     }
 
-    CMSampleTimingInfo timing = kCMTimingInfoInvalid;
-    if (CMSampleBufferGetSampleTimingInfo(origSampleBuffer, 0, &timing) != noErr) {
-        CFRelease(fmtDesc);
-        CFRelease(dstBuf);
-        return NULL;
-    }
-
     CMSampleBufferRef outSample = NULL;
-    OSStatus sbStatus = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, dstBuf, fmtDesc, &timing, &outSample);
+    OSStatus sbStatus = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, dstBuf, fmtDesc, timing, &outSample);
     CFRelease(fmtDesc);
     CFRelease(dstBuf);
 
@@ -333,16 +365,185 @@ CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSa
     return outSample;
 }
 
-@interface BBProxyDelegate : NSProxy <AVCaptureVideoDataOutputSampleBufferDelegate>
+CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSampleBuffer, const char *ringPath) {
+    if (!origSampleBuffer || !ringPath) return NULL;
+
+    CVImageBufferRef origImg = CMSampleBufferGetImageBuffer(origSampleBuffer);
+    if (!origImg) return NULL;
+
+    uint32_t dstW = (uint32_t)CVPixelBufferGetWidth(origImg);
+    uint32_t dstH = (uint32_t)CVPixelBufferGetHeight(origImg);
+    OSType dstFmt = CVPixelBufferGetPixelFormatType(origImg);
+    if (dstW == 0 || dstH == 0) return NULL;
+
+    CMSampleTimingInfo timing = kCMTimingInfoInvalid;
+    if (CMSampleBufferGetSampleTimingInfo(origSampleBuffer, 0, &timing) != noErr) {
+        return NULL;
+    }
+
+    return BBCameraHookCreateSampleBufferFromRing(dstW, dstH, dstFmt, &timing, ringPath);
+}
+
+@interface BBProxyDelegate : NSProxy <AVCaptureVideoDataOutputSampleBufferDelegate> {
+    os_unfair_lock _pumpLock;
+    dispatch_source_t _pumpTimer;
+    _Atomic uint64_t _lastRealFrameNs;
+    CMTime _lastSyntheticPTS;
+}
 @property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> target;
-- (instancetype)initWithTarget:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)target;
+@property (nonatomic, weak) id output;
+@property (nonatomic, strong) dispatch_queue_t callbackQueue;
+- (instancetype)initWithTarget:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)target
+                        output:(id)output
+                         queue:(dispatch_queue_t)queue;
+- (void)startPumpIfNeeded;
+- (void)stopPump;
 @end
 
 @implementation BBProxyDelegate
 
-- (instancetype)initWithTarget:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)target {
+- (instancetype)initWithTarget:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)target
+                        output:(id)output
+                         queue:(dispatch_queue_t)queue {
     _target = target;
+    _output = output;
+    _callbackQueue = queue;
+    _pumpLock = OS_UNFAIR_LOCK_INIT;
+    _pumpTimer = nil;
+    atomic_store_explicit(&_lastRealFrameNs, 0, memory_order_relaxed);
+    _lastSyntheticPTS = kCMTimeInvalid;
     return self;
+}
+
+- (void)dealloc {
+    [self stopPump];
+}
+
+- (void)startPumpIfNeeded {
+    if (!_callbackQueue || !_target || !_output) return;
+
+    os_unfair_lock_lock(&_pumpLock);
+    if (!_pumpTimer) {
+        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _callbackQueue);
+        if (timer) {
+            uint64_t intervalNs = NSEC_PER_SEC / 30;
+            dispatch_source_set_timer(timer,
+                                      dispatch_time(DISPATCH_TIME_NOW, (int64_t)intervalNs),
+                                      intervalNs,
+                                      NSEC_PER_MSEC * 5);
+            __weak BBProxyDelegate *weakSelf = self;
+            dispatch_source_set_event_handler(timer, ^{
+                [weakSelf pumpTick];
+            });
+            _pumpTimer = timer;
+            dispatch_resume(timer);
+        }
+    }
+    os_unfair_lock_unlock(&_pumpLock);
+}
+
+- (void)stopPump {
+    os_unfair_lock_lock(&_pumpLock);
+    dispatch_source_t timer = _pumpTimer;
+    _pumpTimer = nil;
+    os_unfair_lock_unlock(&_pumpLock);
+    if (timer) {
+        dispatch_source_cancel(timer);
+    }
+}
+
+static uint32_t bb_u32(id v) {
+    if ([v isKindOfClass:[NSArray class]]) {
+        v = [(NSArray *)v firstObject];
+    }
+    return [v isKindOfClass:[NSNumber class]] ? [v unsignedIntValue] : 0;
+}
+
+- (void)pumpTick {
+    id<AVCaptureVideoDataOutputSampleBufferDelegate> target = _target;
+    id output = _output;
+    if (!target || !output) {
+        [self stopPump];
+        return;
+    }
+
+    uint64_t nowNs = bb_now_ns();
+    uint64_t lastReal = atomic_load_explicit(&_lastRealFrameNs, memory_order_relaxed);
+    if (lastReal != 0 && nowNs > lastReal && (nowNs - lastReal) < 250000000ULL) {
+        return;
+    }
+
+    SEL sessionSel = @selector(session);
+    if (![output respondsToSelector:sessionSel]) return;
+    id session = ((id (*)(id, SEL))objc_msgSend)(output, sessionSel);
+    if (!session || ![session respondsToSelector:@selector(isRunning)]) return;
+    BOOL isRunning = ((BOOL (*)(id, SEL))objc_msgSend)(session, @selector(isRunning));
+    if (!isRunning) return;
+
+    if (![output respondsToSelector:@selector(connectionWithMediaType:)]) return;
+    AVCaptureConnection *conn = [output connectionWithMediaType:AVMediaTypeVideo];
+    if (!conn || !conn.isEnabled || !conn.isActive) return;
+
+    uint32_t dstW = 0;
+    uint32_t dstH = 0;
+    OSType dstFmt = 0;
+    if ([output respondsToSelector:@selector(videoSettings)]) {
+        NSDictionary *settings = [output videoSettings];
+        if ([settings isKindOfClass:[NSDictionary class]]) {
+            dstW = bb_u32(settings[(id)kCVPixelBufferWidthKey]);
+            dstH = bb_u32(settings[(id)kCVPixelBufferHeightKey]);
+            dstFmt = (OSType)bb_u32(settings[(id)kCVPixelBufferPixelFormatTypeKey]);
+        }
+    }
+
+    AVCaptureInputPort *port = conn.inputPorts.firstObject;
+    if (dstW == 0 || dstH == 0) {
+        CMFormatDescriptionRef portFmt = (port && [port respondsToSelector:@selector(formatDescription)]) ? port.formatDescription : NULL;
+        if (portFmt) {
+            CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(portFmt);
+            if (dims.width > 0 && dims.height > 0) {
+                dstW = (uint32_t)dims.width;
+                dstH = (uint32_t)dims.height;
+            }
+            if (dstFmt == 0) {
+                dstFmt = CMFormatDescriptionGetMediaSubType(portFmt);
+            }
+        }
+    }
+
+    CMClockRef clock = (port && [port respondsToSelector:@selector(clock)]) ? port.clock : NULL;
+    if (!clock) {
+        clock = CMClockGetHostTimeClock();
+    }
+    CMTime pts = CMClockGetTime(clock);
+    if (CMTIME_IS_VALID(_lastSyntheticPTS) && CMTimeCompare(pts, _lastSyntheticPTS) <= 0) {
+        int32_t ts = pts.timescale > 0 ? pts.timescale : 1000000000;
+        pts = CMTimeAdd(_lastSyntheticPTS, CMTimeMake(1, ts));
+    }
+    _lastSyntheticPTS = pts;
+
+    CMSampleTimingInfo timing = {
+        .duration = CMTimeMake(1, 30),
+        .presentationTimeStamp = pts,
+        .decodeTimeStamp = kCMTimeInvalid
+    };
+
+    CMSampleBufferRef synthetic = NULL;
+    @try {
+        synthetic = BBCameraHookCreateSampleBufferFromRing(dstW, dstH, dstFmt, &timing, g_ringPath);
+    } @catch (NSException *ex) {
+        synthetic = NULL;
+    }
+
+    if (synthetic) {
+        static atomic_flag loggedFirstSynthetic = ATOMIC_FLAG_INIT;
+        if (!atomic_flag_test_and_set_explicit(&loggedFirstSynthetic, memory_order_relaxed)) {
+            os_log(OS_LOG_DEFAULT, "BlueBubblesCameraHook: pumping first synthetic clamshell frame (%ux%u fmt=0x%x)",
+                   dstW, dstH, (unsigned int)dstFmt);
+        }
+        [target captureOutput:output didOutputSampleBuffer:synthetic fromConnection:conn];
+        CFRelease(synthetic);
+    }
 }
 
 - (id)forwardingTargetForSelector:(SEL)aSelector {
@@ -371,17 +572,22 @@ CMSampleBufferRef BBCameraHookCreateSwappedSampleBuffer(CMSampleBufferRef origSa
 - (void)captureOutput:(AVCaptureOutput *)output
 didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
+    atomic_store_explicit(&_lastRealFrameNs, bb_now_ns(), memory_order_relaxed);
     id<AVCaptureVideoDataOutputSampleBufferDelegate> target = _target;
     if (!target) return;
 
     CMSampleBufferRef swapped = NULL;
     @try {
-        swapped = BBCameraHookCreateSwappedSampleBuffer(sampleBuffer, BB_RING_PATH);
+        swapped = BBCameraHookCreateSwappedSampleBuffer(sampleBuffer, g_ringPath);
     } @catch (NSException *ex) {
         swapped = NULL;
     }
 
     if (swapped) {
+        static atomic_flag loggedFirstSwap = ATOMIC_FLAG_INIT;
+        if (!atomic_flag_test_and_set_explicit(&loggedFirstSwap, memory_order_relaxed)) {
+            os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: returning first swapped frame");
+        }
         [target captureOutput:output didOutputSampleBuffer:swapped fromConnection:connection];
         CFRelease(swapped);
     } else {
@@ -393,22 +599,36 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
 static const void *kBBProxyAssocKey = &kBBProxyAssocKey;
 static IMP g_origSetSampleBufferDelegate = NULL;
-static NSHashTable<AVCaptureVideoDataOutput *> *g_activeOutputs = nil;
+static IMP g_origSetSampleBufferDelegateTundra = NULL;
+static NSHashTable<id> *g_activeOutputs = nil;
 
-static void bb_swizzled_setSampleBufferDelegate(
-    AVCaptureVideoDataOutput *self,
+static void bb_handle_setSampleBufferDelegate(
+    id self,
     SEL _cmd,
     id<AVCaptureVideoDataOutputSampleBufferDelegate> delegate,
-    dispatch_queue_t queue)
+    dispatch_queue_t queue,
+    IMP origIMP)
 {
+    static atomic_flag loggedFirstDelegate = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set_explicit(&loggedFirstDelegate, memory_order_relaxed)) {
+        os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: intercepted setSampleBufferDelegate:queue: on %{public}@ (delegate=%{public}@)",
+                    NSStringFromClass(object_getClass(self)),
+                    delegate ? NSStringFromClass(object_getClass(delegate)) : @"nil");
+    }
+
+    BBProxyDelegate *oldProxy = objc_getAssociatedObject(self, kBBProxyAssocKey);
+    if (oldProxy && oldProxy != delegate) {
+        [oldProxy stopPump];
+    }
+
     id<AVCaptureVideoDataOutputSampleBufferDelegate> forwardDelegate = delegate;
     BBProxyDelegate *newProxy = nil;
     if (delegate && object_getClass(delegate) != [BBProxyDelegate class]) {
-        newProxy = [[BBProxyDelegate alloc] initWithTarget:delegate];
+        newProxy = [[BBProxyDelegate alloc] initWithTarget:delegate output:self queue:queue];
         forwardDelegate = newProxy;
     }
 
-    ((void (*)(id, SEL, id, dispatch_queue_t))g_origSetSampleBufferDelegate)(self, _cmd, forwardDelegate, queue);
+    ((void (*)(id, SEL, id, dispatch_queue_t))origIMP)(self, _cmd, forwardDelegate, queue);
 
     if (newProxy) {
         objc_setAssociatedObject(self, kBBProxyAssocKey, newProxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -418,8 +638,9 @@ static void bb_swizzled_setSampleBufferDelegate(
             }
             [g_activeOutputs addObject:self];
         }
+        [newProxy startPumpIfNeeded];
     } else if (!delegate) {
-        BOOL hadProxy = (objc_getAssociatedObject(self, kBBProxyAssocKey) != nil);
+        BOOL hadProxy = (oldProxy != nil);
         objc_setAssociatedObject(self, kBBProxyAssocKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (hadProxy) {
             BOOL shouldClose = NO;
@@ -436,19 +657,609 @@ static void bb_swizzled_setSampleBufferDelegate(
     }
 }
 
+static void bb_swizzled_setSampleBufferDelegate(
+    id self,
+    SEL _cmd,
+    id<AVCaptureVideoDataOutputSampleBufferDelegate> delegate,
+    dispatch_queue_t queue)
+{
+    bb_handle_setSampleBufferDelegate(self, _cmd, delegate, queue, g_origSetSampleBufferDelegate);
+}
+
+static void bb_swizzled_setSampleBufferDelegate_tundra(
+    id self,
+    SEL _cmd,
+    id<AVCaptureVideoDataOutputSampleBufferDelegate> delegate,
+    dispatch_queue_t queue)
+{
+    bb_handle_setSampleBufferDelegate(self, _cmd, delegate, queue, g_origSetSampleBufferDelegateTundra);
+}
+
+static BOOL bb_should_unsuspend_camera(void) {
+    if (g_activeFlagPath && access(g_activeFlagPath, F_OK) == 0) {
+        return YES;
+    }
+    @synchronized ([BBProxyDelegate class]) {
+        if (g_activeOutputs && g_activeOutputs.count > 0) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static IMP g_origIsSuspendedBase = NULL;
+static IMP g_origIsSuspendedTundra = NULL;
+static IMP g_origIsSuspendedDAL = NULL;
+
+static BOOL bb_handle_isSuspended(id self, SEL _cmd, IMP origIMP) {
+    if (bb_should_unsuspend_camera()) {
+        return NO;
+    }
+    if (origIMP) {
+        return ((BOOL (*)(id, SEL))origIMP)(self, _cmd);
+    }
+    return NO;
+}
+
+static BOOL bb_swizzled_isSuspended_base(id self, SEL _cmd) {
+    return bb_handle_isSuspended(self, _cmd, g_origIsSuspendedBase);
+}
+
+static BOOL bb_swizzled_isSuspended_tundra(id self, SEL _cmd) {
+    return bb_handle_isSuspended(self, _cmd, g_origIsSuspendedTundra);
+}
+
+static BOOL bb_swizzled_isSuspended_dal(id self, SEL _cmd) {
+    return bb_handle_isSuspended(self, _cmd, g_origIsSuspendedDAL);
+}
+
+BOOL BBCameraHookInstallSuspendedOnClasses(Class baseCls, Class tundraCls, Class dalCls) {
+    SEL sel = @selector(isSuspended);
+    Method baseMethod = baseCls ? class_getInstanceMethod(baseCls, sel) : NULL;
+    BOOL hookedBase = NO;
+    if (baseMethod) {
+        g_origIsSuspendedBase = method_setImplementation(baseMethod, (IMP)bb_swizzled_isSuspended_base);
+        hookedBase = (g_origIsSuspendedBase != NULL);
+    }
+
+    Method tundraMethod = tundraCls ? class_getInstanceMethod(tundraCls, sel) : NULL;
+    BOOL hookedTundra = NO;
+    if (tundraMethod && tundraMethod != baseMethod) {
+        g_origIsSuspendedTundra = method_setImplementation(tundraMethod, (IMP)bb_swizzled_isSuspended_tundra);
+        hookedTundra = (g_origIsSuspendedTundra != NULL);
+    }
+
+    Method dalMethod = dalCls ? class_getInstanceMethod(dalCls, sel) : NULL;
+    BOOL hookedDal = NO;
+    if (dalMethod && dalMethod != baseMethod && dalMethod != tundraMethod) {
+        g_origIsSuspendedDAL = method_setImplementation(dalMethod, (IMP)bb_swizzled_isSuspended_dal);
+        hookedDal = (g_origIsSuspendedDAL != NULL);
+    }
+
+    os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: hooked isSuspended base=%d tundra=%d dal=%d",
+                hookedBase ? 1 : 0, hookedTundra ? 1 : 0, hookedDal ? 1 : 0);
+    return hookedBase || hookedTundra || hookedDal;
+}
+
+BOOL BBCameraHookInstallOnClasses(Class baseCls, Class tundraCls) {
+    SEL sel = @selector(setSampleBufferDelegate:queue:);
+    Method baseMethod = baseCls ? class_getInstanceMethod(baseCls, sel) : NULL;
+    BOOL hookedBase = NO;
+    if (baseMethod) {
+        g_origSetSampleBufferDelegate = method_setImplementation(baseMethod, (IMP)bb_swizzled_setSampleBufferDelegate);
+        hookedBase = (g_origSetSampleBufferDelegate != NULL);
+    }
+
+    Method tundraMethod = tundraCls ? class_getInstanceMethod(tundraCls, sel) : NULL;
+    BOOL hookedTundra = NO;
+    if (tundraMethod && tundraMethod != baseMethod) {
+        g_origSetSampleBufferDelegateTundra = method_setImplementation(tundraMethod, (IMP)bb_swizzled_setSampleBufferDelegate_tundra);
+        hookedTundra = (g_origSetSampleBufferDelegateTundra != NULL);
+    }
+
+    os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: hooked classes base=%{public}@ (%d) tundra=%{public}@ (%d)",
+                baseCls ? NSStringFromClass(baseCls) : @"nil", hookedBase ? 1 : 0,
+                tundraCls ? NSStringFromClass(tundraCls) : @"nil", hookedTundra ? 1 : 0);
+    return hookedBase || hookedTundra;
+}
+
+typedef struct {
+    int fd;
+    void *map;
+    size_t map_size;
+    VTPixelTransferSessionRef transfer_session;
+    CVPixelBufferPoolRef nv12_pool;
+    uint32_t pool_w;
+    uint32_t pool_h;
+    char mapped_path[512];
+} BBDownlinkRingWriter;
+
+static os_unfair_lock g_downlink_lock = OS_UNFAIR_LOCK_INIT;
+static BBDownlinkRingWriter g_downlink = {.fd = -1};
+static IMP g_origShowDecodedFrame = NULL;
+static IMP g_origReceivedRemoteFrame = NULL;
+static IMP g_origNotifyRemoteFrame = NULL;
+static IMP g_origVideoRelayEnqueue = NULL;
+static IMP g_origBufferPoolAddFrame = NULL;
+static IMP g_origReceiverDefaultInit = NULL;
+typedef struct {
+    void *fn0;
+    void *fn1;
+} BBVideoReceiverVTable;
+static void *g_origDidReceiveRemoteFrame = NULL;
+static BBVideoReceiverVTable g_wrappedReceiverVTable = {NULL, NULL};
+
+static void bb_downlink_unmap(BBDownlinkRingWriter *w) {
+    if (w->map && w->map != MAP_FAILED) {
+        munmap(w->map, w->map_size);
+    }
+    w->map = NULL;
+    w->map_size = 0;
+    if (w->fd >= 0) {
+        close(w->fd);
+        w->fd = -1;
+    }
+    w->mapped_path[0] = '\0';
+}
+
+static BOOL bb_downlink_ensure_mapped(BBDownlinkRingWriter *w) {
+    const char *path = g_downlinkRingPath ? g_downlinkRingPath : BB_DOWNLINK_RING_PATH;
+    if (w->map && strcmp(w->mapped_path, path) == 0) {
+        return YES;
+    }
+    bb_downlink_unmap(w);
+
+    int fd = open(path, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) return NO;
+    (void)fchmod(fd, 0666);
+
+    size_t totalSize = sizeof(BBCameraRingHeader) + (size_t)BB_DOWNLINK_RING_SLOTS * (size_t)BB_DOWNLINK_SLOT_BYTES;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || (size_t)st.st_size < totalSize) {
+        if (ftruncate(fd, (off_t)totalSize) != 0) {
+            close(fd);
+            return NO;
+        }
+    }
+
+    void *map = mmap(NULL, totalSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        return NO;
+    }
+
+    BBCameraRingHeader *hdr = (BBCameraRingHeader *)map;
+    if (hdr->magic != BB_RING_MAGIC || hdr->version != BB_RING_VERSION ||
+        hdr->slots != BB_DOWNLINK_RING_SLOTS || hdr->slot_bytes != BB_DOWNLINK_SLOT_BYTES) {
+        memset(hdr, 0, sizeof(*hdr));
+        hdr->magic = BB_RING_MAGIC;
+        hdr->version = BB_RING_VERSION;
+        hdr->format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        hdr->slots = BB_DOWNLINK_RING_SLOTS;
+        hdr->slot_bytes = BB_DOWNLINK_SLOT_BYTES;
+        atomic_store_explicit(&hdr->seq, 0, memory_order_release);
+    }
+
+    w->fd = fd;
+    w->map = map;
+    w->map_size = totalSize;
+    strlcpy(w->mapped_path, path, sizeof(w->mapped_path));
+    return YES;
+}
+
+static CVPixelBufferRef bb_downlink_ensure_nv12(BBDownlinkRingWriter *w, CVPixelBufferRef src, uint32_t width, uint32_t height) {
+    OSType fmt = CVPixelBufferGetPixelFormatType(src);
+    if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+        fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        return (CVPixelBufferRef)CFRetain(src);
+    }
+    if (!w->transfer_session) {
+        if (VTPixelTransferSessionCreate(kCFAllocatorDefault, &w->transfer_session) != noErr) {
+            return NULL;
+        }
+    }
+    if (!w->nv12_pool || w->pool_w != width || w->pool_h != height) {
+        if (w->nv12_pool) {
+            CVPixelBufferPoolRelease(w->nv12_pool);
+            w->nv12_pool = NULL;
+        }
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            (id)kCVPixelBufferWidthKey: @(width),
+            (id)kCVPixelBufferHeightKey: @(height),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
+        if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)attrs, &w->nv12_pool) != kCVReturnSuccess) {
+            return NULL;
+        }
+        w->pool_w = width;
+        w->pool_h = height;
+    }
+    CVPixelBufferRef dst = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, w->nv12_pool, &dst) != kCVReturnSuccess || !dst) {
+        return NULL;
+    }
+    if (VTPixelTransferSessionTransferImage(w->transfer_session, src, dst) != noErr) {
+        CVPixelBufferRelease(dst);
+        return NULL;
+    }
+    return dst;
+}
+
+static BOOL bb_extract_orientation(id videoAttrs, uint32_t *outOrientation) {
+    if (!videoAttrs || !outOrientation) return NO;
+    if ([videoAttrs respondsToSelector:@selector(orientation)]) {
+        NSInteger ori = ((NSInteger (*)(id, SEL))objc_msgSend)(videoAttrs, @selector(orientation));
+        if (ori >= 0 && ori <= 3) {
+            *outOrientation = (uint32_t)ori;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+BOOL BBCameraHookWriteDownlinkPixelBufferWithOrientation(CVPixelBufferRef frame, uint32_t orientation, BOOL hasOrientation) {
+    if (!frame) return NO;
+    size_t rawW = CVPixelBufferGetWidth(frame);
+    size_t rawH = CVPixelBufferGetHeight(frame);
+    uint32_t w = (uint32_t)(rawW & ~((size_t)1));
+    uint32_t h = (uint32_t)(rawH & ~((size_t)1));
+    if (w < 2 || h < 2 || w > BB_RING_MAX_DIM || h > BB_RING_MAX_DIM || ((uint64_t)w * (uint64_t)h) > BB_RING_MAX_PIXELS) {
+        return NO;
+    }
+
+    os_unfair_lock_lock(&g_downlink_lock);
+    if (!bb_downlink_ensure_mapped(&g_downlink)) {
+        os_unfair_lock_unlock(&g_downlink_lock);
+        return NO;
+    }
+
+    CVPixelBufferRef nv12 = bb_downlink_ensure_nv12(&g_downlink, frame, w, h);
+    if (!nv12) {
+        os_unfair_lock_unlock(&g_downlink_lock);
+        return NO;
+    }
+
+    BOOL ok = NO;
+    if (CVPixelBufferLockBaseAddress(nv12, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
+        const uint8_t *ySrc = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(nv12, 0);
+        const uint8_t *uvSrc = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(nv12, 1);
+        size_t yBpr = CVPixelBufferGetBytesPerRowOfPlane(nv12, 0);
+        size_t uvBpr = CVPixelBufferGetBytesPerRowOfPlane(nv12, 1);
+        size_t needed = (size_t)w * (size_t)h + (size_t)w * (size_t)(h / 2);
+        if (ySrc && uvSrc && yBpr >= w && uvBpr >= w && needed <= BB_DOWNLINK_SLOT_BYTES) {
+            BBCameraRingHeader *hdr = (BBCameraRingHeader *)g_downlink.map;
+            uint64_t curSeq = atomic_load_explicit(&hdr->seq, memory_order_relaxed);
+            uint64_t nextSeq = curSeq + 1;
+            uint32_t slotIdx = (uint32_t)(nextSeq % hdr->slots);
+            uint8_t *slotPtr = (uint8_t *)g_downlink.map + sizeof(BBCameraRingHeader) + (size_t)slotIdx * (size_t)hdr->slot_bytes;
+            uint8_t *yDst = slotPtr;
+            for (uint32_t row = 0; row < h; row++) {
+                memcpy(yDst + (size_t)row * w, ySrc + (size_t)row * yBpr, w);
+            }
+            uint8_t *uvDst = slotPtr + (size_t)w * (size_t)h;
+            uint32_t uvRows = h / 2;
+            for (uint32_t row = 0; row < uvRows; row++) {
+                memcpy(uvDst + (size_t)row * w, uvSrc + (size_t)row * uvBpr, w);
+            }
+            hdr->width = w;
+            hdr->height = h;
+            hdr->stride = w;
+            hdr->format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+            hdr->ts_ns = bb_now_ns();
+            hdr->orientation = hasOrientation ? (orientation & 0x03u) : 0u;
+            hdr->flags = hasOrientation ? 1u : 0u;
+            atomic_store_explicit(&hdr->seq, nextSeq, memory_order_release);
+            ok = YES;
+        }
+        CVPixelBufferUnlockBaseAddress(nv12, kCVPixelBufferLock_ReadOnly);
+    }
+    CVPixelBufferRelease(nv12);
+    os_unfair_lock_unlock(&g_downlink_lock);
+    return ok;
+}
+
+BOOL BBCameraHookWriteDownlinkPixelBuffer(CVPixelBufferRef frame) {
+    return BBCameraHookWriteDownlinkPixelBufferWithOrientation(frame, 0, NO);
+}
+
+static int bb_swizzled_showDecodedFrame(id self, SEL _cmd, CVPixelBufferRef frame, CMTime time) {
+    if (frame != NULL) {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: capturing decoded downlink stream (%zux%zu)",
+                        CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame));
+        });
+        BBCameraHookWriteDownlinkPixelBuffer(frame);
+    }
+    if (g_origShowDecodedFrame) {
+        return ((int (*)(id, SEL, CVPixelBufferRef, CMTime))g_origShowDecodedFrame)(self, _cmd, frame, time);
+    }
+    return 0;
+}
+
+static BOOL bb_swizzled_receivedRemoteFrame(id self, SEL _cmd, id session, CVPixelBufferRef frame, CMTime time, id screenAttrs, id videoAttrs, BOOL isFirst, BOOL isPaused) {
+    if (frame != NULL) {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: VideoConference receivedRemoteFrame (%zux%zu)",
+                        CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame));
+        });
+        uint32_t ori = 0;
+        BOOL hasOri = bb_extract_orientation(videoAttrs, &ori);
+        BBCameraHookWriteDownlinkPixelBufferWithOrientation(frame, ori, hasOri);
+    }
+    if (g_origReceivedRemoteFrame) {
+        return ((BOOL (*)(id, SEL, id, CVPixelBufferRef, CMTime, id, id, BOOL, BOOL))g_origReceivedRemoteFrame)(
+            self, _cmd, session, frame, time, screenAttrs, videoAttrs, isFirst, isPaused);
+    }
+    return NO;
+}
+
+static void bb_swizzled_notifyRemoteFrame(id self, SEL _cmd, CVPixelBufferRef frame, CMTime time, uint8_t camBits, id videoAttrs, id screenAttrs) {
+    if (frame != NULL) {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: VCCallSession notifyRemoteFrame (%zux%zu)",
+                        CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame));
+        });
+        uint32_t ori = 0;
+        BOOL hasOri = bb_extract_orientation(videoAttrs, &ori);
+        if (!hasOri) {
+            ori = (uint32_t)(camBits & 0x03u);
+            hasOri = YES;
+        }
+        BBCameraHookWriteDownlinkPixelBufferWithOrientation(frame, ori, hasOri);
+    }
+    if (g_origNotifyRemoteFrame) {
+        ((void (*)(id, SEL, CVPixelBufferRef, CMTime, uint8_t, id, id))g_origNotifyRemoteFrame)(
+            self, _cmd, frame, time, camBits, videoAttrs, screenAttrs);
+    }
+}
+
+static BOOL bb_swizzled_videoRelayEnqueue(id self, SEL _cmd, CVPixelBufferRef frame, CMTime time, uint8_t camBits) {
+    if (frame != NULL) {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: VCVideoRelay enqueueFrame (%zux%zu)",
+                        CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame));
+        });
+    }
+    if (g_origVideoRelayEnqueue) {
+        return ((BOOL (*)(id, SEL, CVPixelBufferRef, CMTime, uint8_t))g_origVideoRelayEnqueue)(self, _cmd, frame, time, camBits);
+    }
+    return NO;
+}
+
+static BOOL bb_swizzled_bufferPoolAddFrame(id self, SEL _cmd, CVPixelBufferRef frame, int64_t time) {
+    if (frame != NULL) {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: VCVideoFrameBufferPool addFrame (%zux%zu)",
+                        CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame));
+        });
+    }
+    if (g_origBufferPoolAddFrame) {
+        return ((BOOL (*)(id, SEL, CVPixelBufferRef, int64_t))g_origBufferPoolAddFrame)(self, _cmd, frame, time);
+    }
+    return NO;
+}
+
+static uint64_t bb_didReceiveRemoteFrame(id self, CVPixelBufferRef frame, const void *cmTimePtr, id a3, id a4, uintptr_t a5) {
+    if (frame != NULL) {
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: capturing VCVideoStream decoded remote frame (%zux%zu)",
+                        CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame));
+        });
+        uint32_t ori = 0;
+        BOOL hasOri = NO;
+        if (self && [self respondsToSelector:@selector(remoteVideoAttributes)]) {
+            id attrs = ((id (*)(id, SEL))objc_msgSend)(self, @selector(remoteVideoAttributes));
+            hasOri = bb_extract_orientation(attrs, &ori);
+        }
+        if (!hasOri && self && [self respondsToSelector:@selector(remoteVideoOrientation)]) {
+            NSInteger rvo = ((NSInteger (*)(id, SEL))objc_msgSend)(self, @selector(remoteVideoOrientation));
+            if (rvo >= 0 && rvo <= 3) {
+                ori = (uint32_t)rvo;
+                hasOri = YES;
+            }
+        }
+        BBCameraHookWriteDownlinkPixelBufferWithOrientation(frame, ori, hasOri);
+    }
+    if (g_origDidReceiveRemoteFrame) {
+        return ((uint64_t (*)(id, CVPixelBufferRef, const void *, id, id, uintptr_t))g_origDidReceiveRemoteFrame)(
+            self, frame, cmTimePtr, a3, a4, a5);
+    }
+    return 0;
+}
+
+static id bb_swizzled_receiverDefaultInit(id self, SEL _cmd, void *cfg, id delegate, void *fns, void *rep, id stats, void *tx, id sca) {
+    void *effectiveFns = fns;
+    if (fns != NULL) {
+        const BBVideoReceiverVTable *vt = (const BBVideoReceiverVTable *)fns;
+        if (vt->fn1 != NULL && vt->fn1 != (void *)bb_didReceiveRemoteFrame) {
+            g_origDidReceiveRemoteFrame = vt->fn1;
+            g_wrappedReceiverVTable.fn0 = vt->fn0;
+            g_wrappedReceiverVTable.fn1 = (void *)bb_didReceiveRemoteFrame;
+        }
+        if (g_wrappedReceiverVTable.fn1 != NULL) {
+            effectiveFns = &g_wrappedReceiverVTable;
+        }
+    }
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: VCVideoReceiverDefault init delegate=%{public}@ fns=%p wrapped=%d",
+                    delegate ? NSStringFromClass([delegate class]) : @"(nil)", fns, effectiveFns == &g_wrappedReceiverVTable);
+    });
+    if (g_origReceiverDefaultInit) {
+        return ((id (*)(id, SEL, void *, id, void *, void *, id, void *, id))g_origReceiverDefaultInit)(
+            self, _cmd, cfg, delegate, effectiveFns, rep, stats, tx, sca);
+    }
+    return nil;
+}
+
+BOOL BBCameraHookInstallDownlinkOnClass(Class receiverCls) {
+    SEL sel = @selector(showDecodedFrame:atTime:);
+    Method m = receiverCls ? class_getInstanceMethod(receiverCls, sel) : NULL;
+    if (!m) {
+        os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: VCVideoStreamReceiver showDecodedFrame:atTime: not found");
+        return NO;
+    }
+    g_origShowDecodedFrame = method_setImplementation(m, (IMP)bb_swizzled_showDecodedFrame);
+    os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: hooked downlink stream on %{public}@ (%d)",
+                NSStringFromClass(receiverCls), g_origShowDecodedFrame != NULL ? 1 : 0);
+
+    Class vcCls = objc_getClass("VideoConference");
+    Method mVC = vcCls ? class_getInstanceMethod(vcCls, @selector(session:receivedRemoteFrame:atTime:withScreenAttributes:videoAttributes:isFirstFrame:isVideoPaused:)) : NULL;
+    if (mVC) g_origReceivedRemoteFrame = method_setImplementation(mVC, (IMP)bb_swizzled_receivedRemoteFrame);
+
+    Class csCls = objc_getClass("VCCallSession");
+    Method mCS = csCls ? class_getInstanceMethod(csCls, @selector(nofityDelegateReceivedRemoteFrame:frameTime:cameraStatusBits:newRemoteVideoAttributes:remoteScreenAttributes:)) : NULL;
+    if (mCS) g_origNotifyRemoteFrame = method_setImplementation(mCS, (IMP)bb_swizzled_notifyRemoteFrame);
+
+    Class vrCls = objc_getClass("VCVideoRelay");
+    Method mVR = vrCls ? class_getInstanceMethod(vrCls, @selector(enqueueFrame:atTime:cameraStatusBits:)) : NULL;
+    if (mVR) g_origVideoRelayEnqueue = method_setImplementation(mVR, (IMP)bb_swizzled_videoRelayEnqueue);
+
+    Class bpCls = objc_getClass("VCVideoFrameBufferPool");
+    Method mBP = bpCls ? class_getInstanceMethod(bpCls, @selector(addFrame:time:)) : NULL;
+    if (mBP) g_origBufferPoolAddFrame = method_setImplementation(mBP, (IMP)bb_swizzled_bufferPoolAddFrame);
+
+    Class rdCls = objc_getClass("VCVideoReceiverDefault");
+    Method mRD = rdCls ? class_getInstanceMethod(rdCls, @selector(initWithConfig:delegate:delegateFunctions:reportingAgent:statisticsCollector:transmitterHandle:sensitiveContentAnalyzer:)) : NULL;
+    if (mRD) g_origReceiverDefaultInit = method_setImplementation(mRD, (IMP)bb_swizzled_receiverDefaultInit);
+
+    os_log_info(OS_LOG_DEFAULT, "BlueBubblesCameraHook: extra hooks vc=%d cs=%d vr=%d bp=%d rd=%d",
+                mVC != NULL, mCS != NULL, mVR != NULL, mBP != NULL, mRD != NULL);
+    return g_origShowDecodedFrame != NULL;
+}
+
+#define BB_DYLD_INTERPOSE(_replacement, _replacee) \
+    __attribute__((used)) static struct { \
+        const void *replacement; \
+        const void *replacee; \
+    } _bb_interpose_##_replacee __attribute__((section("__DATA,__interpose"))) = { \
+        (const void *)(unsigned long)&_replacement, \
+        (const void *)(unsigned long)&_replacee \
+    };
+
+static bool bb_is_avconferenced(void) {
+    const char *prog = getprogname();
+    return prog && strcmp(prog, "avconferenced") == 0;
+}
+
+static bool bb_audio_unit_input_is_blackhole(AudioUnit unit) {
+    AudioDeviceID devID = kAudioObjectUnknown;
+    UInt32 devSize = sizeof(devID);
+    OSStatus st = AudioUnitGetProperty(
+        unit,
+        kAudioOutputUnitProperty_CurrentDevice,
+        kAudioUnitScope_Global,
+        1,
+        &devID,
+        &devSize);
+    if (st != noErr || devID == kAudioObjectUnknown) {
+        devSize = sizeof(devID);
+        st = AudioUnitGetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Input,
+            1,
+            &devID,
+            &devSize);
+    }
+    if (st != noErr || devID == kAudioObjectUnknown) {
+        return false;
+    }
+
+    CFStringRef uid = NULL;
+    UInt32 uidSize = sizeof(uid);
+    AudioObjectPropertyAddress addr = {
+        kAudioDevicePropertyDeviceUID,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    if (AudioObjectGetPropertyData(devID, &addr, 0, NULL, &uidSize, &uid) == noErr && uid != NULL) {
+        Boolean found = CFStringFind(uid, CFSTR("BlackHole"), 0).location != kCFNotFound;
+        CFRelease(uid);
+        return found;
+    }
+    return false;
+}
+
+static bool bb_should_bypass_vpio(AudioUnit unit) {
+    if (!unit) return false;
+    AudioComponent comp = AudioComponentInstanceGetComponent((AudioComponentInstance)unit);
+    if (!comp) return false;
+    AudioComponentDescription desc = {0};
+    if (AudioComponentGetDescription(comp, &desc) != noErr) return false;
+    if (desc.componentType != kAudioUnitType_Output ||
+        desc.componentSubType != kAudioUnitSubType_VoiceProcessingIO) {
+        return false;
+    }
+    if (access(g_activeFlagPath, F_OK) == 0) {
+        return true;
+    }
+    return bb_audio_unit_input_is_blackhole(unit);
+}
+
+BOOL BBCameraHookShouldBypassVPIO(AudioUnit unit) {
+    return bb_should_bypass_vpio(unit);
+}
+
+static OSStatus bb_AudioUnitInitialize(AudioUnit inUnit) {
+    if (bb_is_avconferenced() && bb_should_bypass_vpio(inUnit)) {
+        UInt32 bypass = 1;
+        OSStatus bypassStatus = AudioUnitSetProperty(
+            inUnit,
+            kAUVoiceIOProperty_BypassVoiceProcessing,
+            kAudioUnitScope_Global,
+            0,
+            &bypass,
+            sizeof(bypass));
+        os_log_info(OS_LOG_DEFAULT,
+                    "BlueBubblesCameraHook: AudioUnitInitialize VPIO bypass=1 unit=%p status=%d",
+                    inUnit, (int)bypassStatus);
+    }
+    return AudioUnitInitialize(inUnit);
+}
+
+static OSStatus bb_AudioUnitSetProperty(
+    AudioUnit inUnit,
+    AudioUnitPropertyID inID,
+    AudioUnitScope inScope,
+    AudioUnitElement inElement,
+    const void *inData,
+    UInt32 inDataSize) {
+    UInt32 one = 1;
+    if (bb_is_avconferenced() &&
+        inID == kAUVoiceIOProperty_BypassVoiceProcessing &&
+        bb_should_bypass_vpio(inUnit)) {
+        inData = &one;
+        inDataSize = sizeof(one);
+        os_log_info(OS_LOG_DEFAULT,
+                    "BlueBubblesCameraHook: AudioUnitSetProperty forced VPIO bypass=1 unit=%p",
+                    inUnit);
+    }
+    return AudioUnitSetProperty(inUnit, inID, inScope, inElement, inData, inDataSize);
+}
+
+BB_DYLD_INTERPOSE(bb_AudioUnitInitialize, AudioUnitInitialize)
+BB_DYLD_INTERPOSE(bb_AudioUnitSetProperty, AudioUnitSetProperty)
+
 __attribute__((constructor))
 static void bb_camera_hook_init(void) {
-    const char *prog = getprogname();
-    if (!prog || strcmp(prog, "avconferenced") != 0) {
+    if (!bb_is_avconferenced()) {
         return;
     }
 
-    Class cls = objc_getClass("AVCaptureVideoDataOutput");
-    if (!cls) return;
-
-    SEL sel = @selector(setSampleBufferDelegate:queue:);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
-
-    g_origSetSampleBufferDelegate = method_setImplementation(m, (IMP)bb_swizzled_setSampleBufferDelegate);
+    BBCameraHookInstallOnClasses(
+        objc_getClass("AVCaptureVideoDataOutput"),
+        objc_getClass("AVCaptureVideoDataOutput_Tundra"));
+    BBCameraHookInstallSuspendedOnClasses(
+        objc_getClass("AVCaptureDevice"),
+        objc_getClass("AVCaptureDevice_Tundra"),
+        objc_getClass("AVCaptureDALDevice"));
+    BBCameraHookInstallDownlinkOnClass(objc_getClass("VCVideoStreamReceiver"));
 }

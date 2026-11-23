@@ -1,6 +1,7 @@
 @import AppKit;
 
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
 
 #import "NetworkController.h"
 #import "Logging.h"
@@ -77,11 +78,12 @@ static TUCall *BBFindCallByIdentifier(TUCallCenter *callCenter, NSString *identi
         call = [callCenter callWithUniqueProxyIdentifier:target];
         if (call != nil) return call;
     }
-    NSArray<TUCall *> *lists[2] = {
+    NSArray<TUCall *> *lists[3] = {
         [callCenter respondsToSelector:@selector(currentCalls)] ? [callCenter currentCalls] : nil,
         [callCenter respondsToSelector:@selector(incomingCalls)] ? [callCenter incomingCalls] : nil,
+        [callCenter respondsToSelector:@selector(callsHostedElsewhere)] ? [callCenter callsHostedElsewhere] : nil,
     };
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         for (TUCall *candidate in lists[i]) {
             NSString *candidateUUID = [candidate respondsToSelector:@selector(callUUID)] ? BBNonEmptyString([candidate callUUID]) : nil;
             if ([candidateUUID isEqualToString:target] ||
@@ -102,6 +104,7 @@ static void BBSendReply(NetworkController *controller, NSString *transaction, NS
 
 @interface BLUEBUBBLESFACETIMEHELPER : NSObject {
     BOOL _listenersRegistered;
+    id _conversationHandoffDelegate;
 }
 + (instancetype)sharedInstance;
 - (void)callStatusChanged:(NSNotification *)notification;
@@ -116,6 +119,8 @@ static void BBSendReply(NetworkController *controller, NSString *transaction, NS
 - (void)generateLinkForCallUUID:(NSString *)callUUID attemptsLeft:(NSInteger)attemptsLeft linkRetriesLeft:(NSInteger)linkRetriesLeft deadline:(NSDate *)deadline transaction:(NSString *)transaction replyController:(NetworkController *)replyController;
 - (NSArray<TUConversation *> *)conversationCandidatesForManager:(TUConversationManager *)manager;
 - (NSDictionary *)conversationDebugDictionary:(TUConversation *)convo;
+- (void)emitHandoffEligibleConversation:(TUConversation *)convo toController:(NetworkController *)controller;
+- (void)replayHandoffEligibleConversationToController:(NetworkController *)controller;
 - (BOOL)handleForkMessage:(NetworkController *)replyController event:(NSString *)event data:(NSDictionary *)data transaction:(NSString *)transaction;
 @end
 
@@ -172,8 +177,26 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
     DLog("BLUEBUBBLESFACETIMEHELPER: %{public}@ loaded into %{public}@ on macOS %ld.%ld", [self className], [[NSBundle mainBundle] bundleIdentifier], (long)major, (long)minor);
 
     if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.FaceTime"] || [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.TelephonyUtilities"]) {
-        DLog("BLUEBUBBLESFACETIMEHELPER: Initializing Connection...");
-        [plugin initializeNetworkController];
+        DLog("BLUEBUBBLESFACETIMEHELPER: Deferring connection until app launch...");
+        if (NSApp != nil && [NSApp isRunning]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [plugin initializeNetworkController];
+            });
+        } else {
+            __block id launchObserver = nil;
+            launchObserver = [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidFinishLaunchingNotification
+                                                                               object:nil
+                                                                                queue:[NSOperationQueue mainQueue]
+                                                                           usingBlock:^(NSNotification * _Nonnull note) {
+                (void)note;
+                if (launchObserver != nil) {
+                    [[NSNotificationCenter defaultCenter] removeObserver:launchObserver];
+                    launchObserver = nil;
+                }
+                DLog("BLUEBUBBLESFACETIMEHELPER: App finished launching; initializing connection...");
+                [plugin initializeNetworkController];
+            }];
+        }
     } else {
         DLog("BLUEBUBBLESFACETIMEHELPER: Injected into non-FaceTime process %@, aborting.", [[NSBundle mainBundle] bundleIdentifier]);
         return;
@@ -218,6 +241,12 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         DLog("BLUEBUBBLESFACETIMEHELPER: Registering call listeners...");
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(callStatusChanged:) name:@"TUCallCenterVideoCallStatusChangedNotification" object:nil];
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(callStatusChanged:) name:@"TUCallCenterCallStatusChangedNotification" object:nil];
+        TUConversationManager *manager = [self sharedConversationManager];
+        Class delegateCls = NSClassFromString(@"BBConversationHandoffDelegate");
+        if (manager != nil && delegateCls != Nil && [manager respondsToSelector:@selector(addDelegate:queue:)]) {
+            _conversationHandoffDelegate = [[delegateCls alloc] init];
+            [manager addDelegate:_conversationHandoffDelegate queue:dispatch_get_main_queue()];
+        }
     }
 }
 
@@ -235,6 +264,11 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
             if (call != nil && ![calls containsObject:call]) [calls addObject:call];
         }
     }
+    if ([callCenter respondsToSelector:@selector(callsHostedElsewhere)]) {
+        for (TUCall *call in [callCenter callsHostedElsewhere]) {
+            if (call != nil && ![calls containsObject:call]) [calls addObject:call];
+        }
+    }
     NetworkController *target = controller ?: [NetworkController sharedInstance];
     for (TUCall *call in calls) {
         NSDictionary *data = [self callStatusPayloadForCall:call];
@@ -242,6 +276,7 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
             [target sendMessage:@{@"event": @"ft-call-status-changed", @"data": data}];
         }
     }
+    [self replayHandoffEligibleConversationToController:target];
 }
 
 -(void) callStatusChanged: (NSNotification *)notification {

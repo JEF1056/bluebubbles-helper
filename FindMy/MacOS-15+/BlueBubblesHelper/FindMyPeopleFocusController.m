@@ -1,11 +1,138 @@
 #import "FindMyPeopleFocusController.h"
 
 #import <Contacts/Contacts.h>
+#import <dlfcn.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <os/log.h>
+#import <stdint.h>
+
+typedef void (*BBFindMyFriendActionCallback)(void *fmfManager, const void *friendPtr, void * _Nullable context);
 
 extern CFTypeRef _Nullable BlueBubblesFindMyCopyPeopleRowsMetadata(void * _Nullable dataSource);
+extern CFTypeRef _Nullable BlueBubblesFindMyCopyChildObject(void * _Nullable object, const char * _Nullable childName);
+extern CFTypeRef _Nullable BlueBubblesFindMyCopyFMFManager(void * _Nullable container);
+extern BOOL BlueBubblesFindMyWithMatchingFriend(
+    void * _Nullable container,
+    void * _Nullable targets,
+    BBFindMyFriendActionCallback _Nullable callback,
+    void * _Nullable context
+);
+
+static __attribute__((noinline)) void BBInvokeFMFSwiftMethod0(void *fn, void *swiftSelf) {
+#if defined(__arm64__) || defined(__aarch64__)
+    register void *x20 __asm__("x20") = swiftSelf;
+    #if __has_feature(ptrauth_calls)
+    __asm__ volatile("blraaz %[fn]" : : [fn]"r"(fn), "r"(x20) : "x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x30","v0","v1","v2","v3","v4","v5","v6","v7","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory","cc");
+    #else
+    __asm__ volatile("blr %[fn]" : : [fn]"r"(fn), "r"(x20) : "x0","x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x30","v0","v1","v2","v3","v4","v5","v6","v7","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory","cc");
+    #endif
+#elif defined(__x86_64__)
+    register void *r13 __asm__("r13") = swiftSelf;
+    __asm__ volatile(
+        "mov %%rsp, %%rbx\n\t"
+        "and $-16, %%rsp\n\t"
+        "call *%[fn]\n\t"
+        "mov %%rbx, %%rsp"
+        : : [fn]"r"(fn), "r"(r13) : "rax","rbx","rcx","rdx","rsi","rdi","r8","r9","r10","r11","xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7","xmm8","xmm9","xmm10","xmm11","xmm12","xmm13","xmm14","xmm15","memory","cc");
+#endif
+}
+
+static __attribute__((noinline)) void BBInvokeFMFSwiftMethodPtr(void *fn, void *swiftSelf, const void *argPtr) {
+#if defined(__arm64__) || defined(__aarch64__)
+    register void *x20 __asm__("x20") = swiftSelf;
+    register const void *x0 __asm__("x0") = argPtr;
+    #if __has_feature(ptrauth_calls)
+    __asm__ volatile("blraaz %[fn]" : "+r"(x0) : [fn]"r"(fn), "r"(x20) : "x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x30","v0","v1","v2","v3","v4","v5","v6","v7","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory","cc");
+    #else
+    __asm__ volatile("blr %[fn]" : "+r"(x0) : [fn]"r"(fn), "r"(x20) : "x1","x2","x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x30","v0","v1","v2","v3","v4","v5","v6","v7","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory","cc");
+    #endif
+#elif defined(__x86_64__)
+    register void *r13 __asm__("r13") = swiftSelf;
+    register const void *rdi __asm__("rdi") = argPtr;
+    __asm__ volatile(
+        "mov %%rsp, %%rbx\n\t"
+        "and $-16, %%rsp\n\t"
+        "call *%[fn]\n\t"
+        "mov %%rbx, %%rsp"
+        : "+r"(rdi) : [fn]"r"(fn), "r"(r13) : "rax","rbx","rcx","rdx","rsi","r8","r9","r10","r11","xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7","xmm8","xmm9","xmm10","xmm11","xmm12","xmm13","xmm14","xmm15","memory","cc");
+#endif
+}
+
+static __attribute__((noinline)) void BBInvokeFMFSwiftMethodPtrNilString(void *fn, void *swiftSelf, const void *argPtr) {
+#if defined(__arm64__) || defined(__aarch64__)
+    register void *x20 __asm__("x20") = swiftSelf;
+    register const void *x0 __asm__("x0") = argPtr;
+    register uint64_t x1 __asm__("x1") = 0;
+    register uint64_t x2 __asm__("x2") = 0;
+    #if __has_feature(ptrauth_calls)
+    __asm__ volatile("blraaz %[fn]" : "+r"(x0), "+r"(x1), "+r"(x2) : [fn]"r"(fn), "r"(x20) : "x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x30","v0","v1","v2","v3","v4","v5","v6","v7","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory","cc");
+    #else
+    __asm__ volatile("blr %[fn]" : "+r"(x0), "+r"(x1), "+r"(x2) : [fn]"r"(fn), "r"(x20) : "x3","x4","x5","x6","x7","x8","x9","x10","x11","x12","x13","x14","x15","x16","x17","x30","v0","v1","v2","v3","v4","v5","v6","v7","v16","v17","v18","v19","v20","v21","v22","v23","v24","v25","v26","v27","v28","v29","v30","v31","memory","cc");
+    #endif
+#elif defined(__x86_64__)
+    register void *r13 __asm__("r13") = swiftSelf;
+    register const void *rdi __asm__("rdi") = argPtr;
+    register uint64_t rsi __asm__("rsi") = 0;
+    register uint64_t rdx __asm__("rdx") = 0;
+    __asm__ volatile(
+        "mov %%rsp, %%rbx\n\t"
+        "and $-16, %%rsp\n\t"
+        "call *%[fn]\n\t"
+        "mov %%rbx, %%rsp"
+        : "+r"(rdi), "+r"(rsi), "+r"(rdx) : [fn]"r"(fn), "r"(r13) : "rax","rbx","rcx","r8","r9","r10","r11","xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7","xmm8","xmm9","xmm10","xmm11","xmm12","xmm13","xmm14","xmm15","memory","cc");
+#endif
+}
+
+static void * _Nullable BBFMFCoreSymbol(const char *symbolName) {
+    static void *fmfCoreHandle = NULL;
+    static BOOL fmfCoreResolved = NO;
+    if (!fmfCoreResolved) {
+        fmfCoreHandle = dlopen("/System/Library/PrivateFrameworks/FMFCore.framework/FMFCore", RTLD_NOLOAD);
+        fmfCoreResolved = YES;
+    }
+    return fmfCoreHandle != NULL ? dlsym(fmfCoreHandle, symbolName) : NULL;
+}
+
+static BOOL BBIsRealFMFManager(void * _Nullable managerPtr) {
+    if (managerPtr == NULL) {
+        return NO;
+    }
+    Class fmfManagerClass = objc_getClass("_TtC7FMFCore10FMFManager") ?: NSClassFromString(@"FMFCore.FMFManager");
+    return fmfManagerClass != Nil && [(__bridge id)managerPtr isKindOfClass:fmfManagerClass];
+}
+
+static void BBFMFStartLiveCallback(void *fmfManager, const void *friendPtr, void * _Nullable context) {
+    if (!BBIsRealFMFManager(fmfManager) || friendPtr == NULL) {
+        return;
+    }
+    void *updateLastActiveFn = BBFMFCoreSymbol("$s7FMFCore10FMFManagerC25updateLastActiveTimestampyyFTj");
+    if (updateLastActiveFn != NULL) {
+        BBInvokeFMFSwiftMethod0(updateLastActiveFn, fmfManager);
+    }
+    void *startLiveFn = BBFMFCoreSymbol("$s7FMFCore10FMFManagerC17startLiveLocation3for9clientAppyAA9FMFFriendV_SSSgtFTj");
+    if (startLiveFn == NULL) {
+        return;
+    }
+    BBInvokeFMFSwiftMethodPtrNilString(startLiveFn, fmfManager, friendPtr);
+    if (context != NULL) {
+        *(BOOL *)context = YES;
+    }
+}
+
+static void BBFMFStopLiveCallback(void *fmfManager, const void *friendPtr, void * _Nullable context) {
+    if (!BBIsRealFMFManager(fmfManager) || friendPtr == NULL) {
+        return;
+    }
+    void *stopLiveFn = BBFMFCoreSymbol("$s7FMFCore10FMFManagerC16stopLiveLocation3foryAA9FMFFriendV_tFTj");
+    if (stopLiveFn == NULL) {
+        return;
+    }
+    BBInvokeFMFSwiftMethodPtr(stopLiveFn, fmfManager, friendPtr);
+    if (context != NULL) {
+        *(BOOL *)context = YES;
+    }
+}
 
 static os_log_t focusLog(void) {
     static os_log_t logger = nil;
@@ -81,6 +208,8 @@ static NSInteger const BBUITableViewScrollPositionMiddle = 2;
 @property (nonatomic, assign) BOOL forcedWindowVisible;
 @property (nonatomic, assign) BOOL forcedFrontmostWindow;
 @property (nonatomic, assign) BOOL lastFocusSwitchedTab;
+@property (nonatomic, assign) BOOL activeFMFLiveStarted;
+@property (nonatomic, assign) NSUInteger fmfLiveGeneration;
 
 - (void)recordPeopleDataSource:(id)dataSource tableView:(nullable id)tableView;
 
@@ -134,9 +263,17 @@ static Ivar _Nullable BBFindIvar(id object, const char *ivarName) {
 }
 
 static id _Nullable BBIvarObjectValue(id object, const char *ivarName) {
+    if (object == nil || ivarName == NULL) {
+        return nil;
+    }
     Ivar ivar = BBFindIvar(object, ivarName);
     const char *encoding = ivar != NULL ? ivar_getTypeEncoding(ivar) : NULL;
-    return (encoding != NULL && encoding[0] == '@') ? object_getIvar(object, ivar) : nil;
+    if (encoding != NULL && encoding[0] == '@') {
+        return object_getIvar(object, ivar);
+    }
+    // Swift ivars report empty ObjC type encodings (""); read reference children via Swift Mirror.
+    CFTypeRef mirrored = BlueBubblesFindMyCopyChildObject((__bridge void *)object, ivarName);
+    return mirrored != NULL ? CFBridgingRelease(mirrored) : nil;
 }
 
 static BOOL *BBBoolIvarPtr(id object, const char *ivarName) {
@@ -266,6 +403,9 @@ static BOOL BBHasLetters(NSString *value) {
         @"FindMy.FMPeopleListDataSource",
         @"_TtC6FindMy22FMPeopleListDataSource",
         @"FMPeopleListDataSource",
+        @"FindMy.FMLegacyPeopleListDataSource",
+        @"_TtC6FindMy28FMLegacyPeopleListDataSource",
+        @"FMLegacyPeopleListDataSource",
     ];
     SEL targetSelector = @selector(tableView:numberOfRowsInSection:);
 
@@ -381,11 +521,14 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
         return cleanedTargets;
     }
     CNContactStore *store = [[CNContactStore alloc] init];
+    // Include phone and email keys so macOS 27 Contacts predicates do not throw CNErrorDomain Code=2.
     NSArray<id<CNKeyDescriptor>> *keys = @[
         [CNContactFormatter descriptorForRequiredKeysForStyle:CNContactFormatterStyleFullName],
         CNContactGivenNameKey,
         CNContactFamilyNameKey,
         CNContactNicknameKey,
+        CNContactPhoneNumbersKey,
+        CNContactEmailAddressesKey,
     ];
     NSMutableArray<NSString *> *augmented = [[NSMutableArray alloc] initWithArray:cleanedTargets];
     NSMutableSet<NSString *> *seenLower = [[NSMutableSet alloc] init];
@@ -403,9 +546,18 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
         }
         NSArray<CNContact *> *contacts = [store unifiedContactsMatchingPredicate:predicate keysToFetch:keys error:nil];
         for (CNContact *contact in contacts) {
+            NSMutableArray<NSString *> *candidates = [[NSMutableArray alloc] init];
             NSString *fullName = [CNContactFormatter stringFromContact:contact style:CNContactFormatterStyleFullName];
-            for (NSString *candidate in @[fullName ?: @"", contact.nickname ?: @""]) {
-                NSString *clean = BBCollapseWhitespace(candidate);
+            BBAddNonEmptyString(candidates, fullName);
+            BBAddNonEmptyString(candidates, contact.nickname);
+            for (CNLabeledValue<CNPhoneNumber *> *phone in contact.phoneNumbers) {
+                BBAddNonEmptyString(candidates, phone.value.stringValue);
+            }
+            for (CNLabeledValue<NSString *> *email in contact.emailAddresses) {
+                BBAddNonEmptyString(candidates, email.value);
+            }
+            for (NSString *candidate in candidates) {
+                NSString *clean = BBCollapseWhitespace(BBStripSchemePrefix(candidate));
                 if (clean.length > 0 && ![seenLower containsObject:clean.lowercaseString]) {
                     [seenLower addObject:clean.lowercaseString];
                     [augmented addObject:clean];
@@ -486,6 +638,291 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
                                           inRootObjects:rootObjects];
 }
 
+- (NSArray *)resolvedRootObjects:(nullable NSArray *)rootObjects {
+    NSMutableArray *roots = [[NSMutableArray alloc] init];
+    if (rootObjects != nil) {
+        [roots addObjectsFromArray:rootObjects];
+        return roots;
+    }
+
+    Class uiAppClass = NSClassFromString(@"UIApplication");
+    if (uiAppClass != Nil && [(id)uiAppClass respondsToSelector:@selector(sharedApplication)]) {
+        id uiApp = [(id<BBFindMyUIKitProxy>)uiAppClass sharedApplication];
+        if (uiApp != nil) {
+            if ([uiApp respondsToSelector:@selector(connectedScenes)]) {
+                NSSet *scenes = [(id<BBFindMyUIKitProxy>)uiApp connectedScenes];
+                for (id scene in scenes) {
+                    if ([scene respondsToSelector:@selector(delegate)]) {
+                        id sceneDelegate = [(id<BBFindMyUIKitProxy>)scene delegate];
+                        if (sceneDelegate != nil) {
+                            [roots addObject:sceneDelegate];
+                        }
+                    }
+                    if ([scene respondsToSelector:@selector(windows)]) {
+                        NSArray *sceneWindows = [(id<BBFindMyUIKitProxy>)scene windows];
+                        if ([sceneWindows isKindOfClass:[NSArray class]]) {
+                            [roots addObjectsFromArray:sceneWindows];
+                        }
+                    }
+                }
+            }
+            if ([uiApp respondsToSelector:@selector(delegate)]) {
+                id appDelegate = [(id<BBFindMyUIKitProxy>)uiApp delegate];
+                if (appDelegate != nil) {
+                    [roots addObject:appDelegate];
+                }
+            }
+            if ([uiApp respondsToSelector:@selector(windows)]) {
+                NSArray *appWindows = [(id<BBFindMyUIKitProxy>)uiApp windows];
+                if ([appWindows isKindOfClass:[NSArray class]]) {
+                    [roots addObjectsFromArray:appWindows];
+                }
+            }
+            if ([uiApp respondsToSelector:@selector(keyWindow)]) {
+                id keyWin = [(id<BBFindMyUIKitProxy>)uiApp keyWindow];
+                if (keyWin != nil) {
+                    [roots addObject:keyWin];
+                }
+            }
+        }
+    }
+    return roots;
+}
+
+- (nullable id)discoverMediatorInRootObjects:(nullable NSArray *)rootObjects {
+    id capturedDS = self.peopleDataSource;
+    if (capturedDS != nil) {
+        id mediator = BBIvarObjectValue(capturedDS, "mediator");
+        if (mediator != nil) {
+            return mediator;
+        }
+    }
+
+    NSArray *roots = [self resolvedRootObjects:rootObjects];
+    NSMutableArray *queue = [[NSMutableArray alloc] initWithArray:roots];
+    NSMutableSet<NSValue *> *visited = [[NSMutableSet alloc] init];
+    NSUInteger index = 0;
+
+    while (index < queue.count && visited.count < BBFocusMaxTreeNodes) {
+        id obj = queue[index++];
+        if (obj == nil) {
+            continue;
+        }
+        NSValue *ptrKey = [NSValue valueWithPointer:(__bridge const void *)obj];
+        if ([visited containsObject:ptrKey]) {
+            continue;
+        }
+        [visited addObject:ptrKey];
+
+        NSString *className = NSStringFromClass([obj class]);
+        if ([className containsString:@"FMMediator"]) {
+            return obj;
+        }
+        id mediator = BBIvarObjectValue(obj, "mediator");
+        if (mediator != nil) {
+            return mediator;
+        }
+        if ([className containsString:@"FMPeopleListViewController"] ||
+            [className containsString:@"FMDevicesListViewController"]) {
+            id typedDS = BBIvarObjectValue(obj, "$__lazy_storage_$_typedDataSource");
+            id dsMediator = typedDS != nil ? BBIvarObjectValue(typedDS, "mediator") : nil;
+            if (dsMediator != nil) {
+                return dsMediator;
+            }
+        }
+
+        for (NSString *selName in @[@"rootViewController", @"presentedViewController"]) {
+            SEL sel = NSSelectorFromString(selName);
+            if ([obj respondsToSelector:sel]) {
+                id child = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+                if (child != nil) {
+                    [queue addObject:child];
+                }
+            }
+        }
+        for (NSString *selName in @[@"childViewControllers", @"viewControllers", @"subviews"]) {
+            SEL sel = NSSelectorFromString(selName);
+            if ([obj respondsToSelector:sel]) {
+                NSArray *children = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+                if ([children isKindOfClass:[NSArray class]]) {
+                    [queue addObjectsFromArray:children];
+                }
+            }
+        }
+        if ([obj respondsToSelector:@selector(view)] &&
+            (![obj respondsToSelector:@selector(isViewLoaded)] || [(id<BBFindMyUIKitProxy>)obj isViewLoaded])) {
+            id view = [(id<BBFindMyUIKitProxy>)obj view];
+            if (view != nil) {
+                [queue addObject:view];
+            }
+        }
+    }
+    return nil;
+}
+
+- (BOOL)invokeFMFLiveStartWithMediator:(id)mediator
+                       expandedTargets:(NSArray<NSString *> *)expanded
+                                 label:(NSString *)label {
+    BOOL invoked = NO;
+    BOOL matched = BlueBubblesFindMyWithMatchingFriend(
+        (__bridge void *)mediator,
+        (__bridge void *)expanded,
+        BBFMFStartLiveCallback,
+        &invoked
+    );
+    self.activeFMFLiveStarted = invoked;
+    if (invoked) {
+        os_log(focusLog(), "Started FMFCore live location for target %{public}@", label);
+    } else if (matched) {
+        os_log(focusLog(), "Matched FMFCore friend for %{public}@ but FMFCore live thunk unavailable", label);
+    }
+    return invoked;
+}
+
+- (BOOL)startFMFLiveLocationForTargets:(NSArray<NSString *> *)targets {
+    self.fmfLiveGeneration += 1;
+    NSUInteger generation = self.fmfLiveGeneration;
+    self.activeFMFLiveStarted = NO;
+    NSArray<NSString *> *cleaned = [self sanitizedTargets:targets];
+    if (cleaned.count == 0) {
+        return NO;
+    }
+    id mediator = [self discoverMediatorInRootObjects:nil];
+    if (mediator == nil) {
+        return NO;
+    }
+    [self ensureBackgroundRefreshConditionsForMediator:mediator];
+
+    NSArray<NSString *> *expanded = [self targetsExpandedWithContacts:cleaned];
+    NSString *label = cleaned.firstObject ?: @"";
+
+    // When FindMy launched on another tab (or just switched to People), FMFManager's FindMyLocate
+    // stream may not have created its locationContinuation yet; warm/wait briefly before startLiveLocation.
+    CFTypeRef managerRef = BlueBubblesFindMyCopyFMFManager((__bridge void *)mediator);
+    if (managerRef != NULL) {
+        id manager = CFBridgingRelease(managerRef);
+        void *managerPtr = (__bridge void *)manager;
+        BOOL isRefreshing = YES;
+        BOOL hasIsRefreshing = BBReadBoolIvar(manager, "isRefreshing", &isRefreshing);
+        BOOL justSwitchedTab = self.lastFocusSwitchedTab;
+        self.lastFocusSwitchedTab = NO;
+        if (BBIsRealFMFManager(managerPtr) && ((hasIsRefreshing && !isRefreshing) || justSwitchedTab)) {
+            void *updateLastActiveFn = BBFMFCoreSymbol("$s7FMFCore10FMFManagerC25updateLastActiveTimestampyyFTj");
+            if (updateLastActiveFn != NULL) {
+                BBInvokeFMFSwiftMethod0(updateLastActiveFn, managerPtr);
+            }
+            if (hasIsRefreshing && !isRefreshing) {
+                void *startRefreshingFn = BBFMFCoreSymbol("$s7FMFCore10FMFManagerC15startRefreshingyyFTj");
+                if (startRefreshingFn != NULL) {
+                    BBInvokeFMFSwiftMethod0(startRefreshingFn, managerPtr);
+                }
+            }
+            os_log(focusLog(), "Warming FMFCore stream before live location for %{public}@", label);
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                dispatch_get_main_queue(),
+                ^{
+                    FindMyPeopleFocusController *strongSelf = weakSelf;
+                    if (strongSelf == nil || strongSelf.fmfLiveGeneration != generation) {
+                        return;
+                    }
+                    id currentMediator = [strongSelf discoverMediatorInRootObjects:nil] ?: mediator;
+                    [strongSelf ensureBackgroundRefreshConditionsForMediator:currentMediator];
+                    [strongSelf invokeFMFLiveStartWithMediator:currentMediator
+                                               expandedTargets:expanded
+                                                         label:label];
+                }
+            );
+            return YES;
+        }
+    }
+
+    return [self invokeFMFLiveStartWithMediator:mediator expandedTargets:expanded label:label];
+}
+
+- (BOOL)stopFMFLiveLocationForTargets:(NSArray<NSString *> *)targets {
+    self.fmfLiveGeneration += 1;
+    self.activeFMFLiveStarted = NO;
+    NSArray<NSString *> *cleaned = [self sanitizedTargets:targets];
+    if (cleaned.count == 0) {
+        return NO;
+    }
+    id mediator = [self discoverMediatorInRootObjects:nil];
+    if (mediator == nil) {
+        return NO;
+    }
+    NSArray<NSString *> *expanded = [self targetsExpandedWithContacts:cleaned];
+    BOOL invoked = NO;
+    BlueBubblesFindMyWithMatchingFriend(
+        (__bridge void *)mediator,
+        (__bridge void *)expanded,
+        BBFMFStopLiveCallback,
+        &invoked
+    );
+    if (invoked) {
+        os_log(focusLog(), "Stopped FMFCore live location for target %{public}@", cleaned.firstObject ?: @"");
+    }
+    return invoked;
+}
+
+- (BOOL)keepaliveFMFLiveLocationForTargets:(NSArray<NSString *> *)targets {
+    id mediator = [self discoverMediatorInRootObjects:nil];
+    if (mediator == nil) {
+        return NO;
+    }
+    [self ensureBackgroundRefreshConditionsForMediator:mediator];
+    CFTypeRef managerRef = BlueBubblesFindMyCopyFMFManager((__bridge void *)mediator);
+    if (managerRef == NULL) {
+        return NO;
+    }
+    id manager = CFBridgingRelease(managerRef);
+    void *managerPtr = (__bridge void *)manager;
+    if (!BBIsRealFMFManager(managerPtr)) {
+        return NO;
+    }
+    BOOL isRefreshing = YES;
+    BOOL needsRestart = !self.activeFMFLiveStarted ||
+        (BBReadBoolIvar(manager, "isRefreshing", &isRefreshing) && !isRefreshing);
+    if (needsRestart && targets.count > 0) {
+        return [self startFMFLiveLocationForTargets:targets];
+    }
+    void *updateLastActiveFn = BBFMFCoreSymbol("$s7FMFCore10FMFManagerC25updateLastActiveTimestampyyFTj");
+    if (updateLastActiveFn != NULL) {
+        BBInvokeFMFSwiftMethod0(updateLastActiveFn, managerPtr);
+        return YES;
+    }
+    return NO;
+}
+
+- (BOOL)triggerFMFShallowRefresh {
+    id mediator = [self discoverMediatorInRootObjects:nil];
+    if (mediator == nil) {
+        return NO;
+    }
+    [self ensureBackgroundRefreshConditionsForMediator:mediator];
+    CFTypeRef managerRef = BlueBubblesFindMyCopyFMFManager((__bridge void *)mediator);
+    if (managerRef == NULL) {
+        return NO;
+    }
+    id manager = CFBridgingRelease(managerRef);
+    void *managerPtr = (__bridge void *)manager;
+    if (!BBIsRealFMFManager(managerPtr)) {
+        return NO;
+    }
+    void *updateLastActiveFn = BBFMFCoreSymbol("$s7FMFCore10FMFManagerC25updateLastActiveTimestampyyFTj");
+    if (updateLastActiveFn != NULL) {
+        BBInvokeFMFSwiftMethod0(updateLastActiveFn, managerPtr);
+    }
+    void *startRefreshingFn = BBFMFCoreSymbol("$s7FMFCore10FMFManagerC15startRefreshingyyFTj");
+    if (startRefreshingFn != NULL) {
+        BBInvokeFMFSwiftMethod0(startRefreshingFn, managerPtr);
+        os_log(focusLog(), "Triggered FMFCore shallow refresh");
+        return YES;
+    }
+    return NO;
+}
+
 - (BOOL)focusPeopleTabAndSelectPreparedTargets:(NSArray<NSString *> *)cleanedTargets
                                  inRootObjects:(nullable NSArray *)rootObjects {
     if (cleanedTargets.count == 0) {
@@ -494,40 +931,7 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
 
     [self installCapture];
 
-    NSMutableArray *roots = [[NSMutableArray alloc] init];
-    if (rootObjects != nil) {
-        [roots addObjectsFromArray:rootObjects];
-    } else {
-        Class uiAppClass = NSClassFromString(@"UIApplication");
-        if (uiAppClass != Nil && [(id)uiAppClass respondsToSelector:@selector(sharedApplication)]) {
-            id uiApp = [(id<BBFindMyUIKitProxy>)uiAppClass sharedApplication];
-            if (uiApp != nil) {
-                if ([uiApp respondsToSelector:@selector(connectedScenes)]) {
-                    NSSet *scenes = [(id<BBFindMyUIKitProxy>)uiApp connectedScenes];
-                    for (id scene in scenes) {
-                        if ([scene respondsToSelector:@selector(windows)]) {
-                            NSArray *sceneWindows = [(id<BBFindMyUIKitProxy>)scene windows];
-                            if ([sceneWindows isKindOfClass:[NSArray class]]) {
-                                [roots addObjectsFromArray:sceneWindows];
-                            }
-                        }
-                    }
-                }
-                if ([uiApp respondsToSelector:@selector(windows)]) {
-                    NSArray *appWindows = [(id<BBFindMyUIKitProxy>)uiApp windows];
-                    if ([appWindows isKindOfClass:[NSArray class]]) {
-                        [roots addObjectsFromArray:appWindows];
-                    }
-                }
-                if ([uiApp respondsToSelector:@selector(keyWindow)]) {
-                    id keyWin = [(id<BBFindMyUIKitProxy>)uiApp keyWindow];
-                    if (keyWin != nil) {
-                        [roots addObject:keyWin];
-                    }
-                }
-            }
-        }
-    }
+    NSArray *roots = [self resolvedRootObjects:rootObjects];
 
     NSMutableArray *sideBarVCs = [[NSMutableArray alloc] init];
     NSMutableArray *embeddedTabBars = [[NSMutableArray alloc] init];
@@ -548,9 +952,19 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
         os_log(focusLog(), "Switched Find My UI to People tab");
     }
 
+    BOOL ensuredCondition = NO;
     for (id sideBarVC in sideBarVCs) {
         id mediator = BBIvarObjectValue(sideBarVC, "mediator");
-        [self ensureBackgroundRefreshConditionsForMediator:mediator];
+        if (mediator != nil) {
+            [self ensureBackgroundRefreshConditionsForMediator:mediator];
+            ensuredCondition = YES;
+        }
+    }
+    if (!ensuredCondition) {
+        id mediator = [self discoverMediatorInRootObjects:roots];
+        if (mediator != nil) {
+            [self ensureBackgroundRefreshConditionsForMediator:mediator];
+        }
     }
 
     if ([self selectMatchingPersonInCapturedDataSourceWithTargets:cleanedTargets candidateTableViews:candidateTableViews]) {
@@ -829,6 +1243,8 @@ allowFuzzySubstring:(BOOL)allowFuzzySubstring {
 
 - (void)restoreBackgroundRefreshConditions {
     self.focusGeneration += 1;
+    self.fmfLiveGeneration += 1;
+    self.activeFMFLiveStarted = NO;
     [self resetForcedBackgroundRefreshFlags];
 }
 

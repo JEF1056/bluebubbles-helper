@@ -830,6 +830,30 @@ int main(void) {
                  @"async friend streaming callback after disconnect must not start location refreshes");
         BBUseAsyncDelayedFriendResolution = NO;
 
+        // 10. SwiftUI-style SceneDelegate mediator discovery forces background refresh conditions without UITableView
+        {
+            FindMyPeopleFocusController *focusController = [FindMyPeopleFocusController sharedInstance];
+            BBMockFMConditionProvider *swiftUIConditions = [[BBMockFMConditionProvider alloc] init];
+            swiftUIConditions->isWindowVisible = NO;
+            swiftUIConditions->isFrontmostWindow = NO;
+            BBMockPeopleMediator *swiftUIMediator = [[BBMockPeopleMediator alloc] init];
+            swiftUIMediator->conditionProvider = swiftUIConditions;
+            BBMockFMSideBarViewController *sceneDelegateHolder = [[BBMockFMSideBarViewController alloc] init];
+            sceneDelegateHolder->mediator = swiftUIMediator;
+
+            id discovered = [focusController discoverMediatorInRootObjects:@[sceneDelegateHolder]];
+            BBAssert(discovered == swiftUIMediator,
+                     @"discoverMediatorInRootObjects must locate mediator from scene/root object graph");
+
+            [focusController focusPeopleTabAndSelectTargets:@[@"alice@example.com"]
+                                              inRootObjects:@[sceneDelegateHolder]];
+            BBAssert(swiftUIConditions->isWindowVisible && swiftUIConditions->isFrontmostWindow,
+                     @"SwiftUI mediator discovery must activate conditionProvider without a UITableView");
+            [focusController restoreBackgroundRefreshConditions];
+            BBAssert(!swiftUIConditions->isWindowVisible && !swiftUIConditions->isFrontmostWindow,
+                     @"restoreBackgroundRefreshConditions must restore SwiftUI conditionProvider flags");
+        }
+
         NSLog(@"PASS: FindMyHelperLiveTests");
     }
     return 0;

@@ -41,6 +41,9 @@ static NSInteger CaptureDevicesDataSourceAndCountRows(id dataSource, SEL selecto
             @"FindMy.FMDevicesListDataSource",
             @"_TtC6FindMy23FMDevicesListDataSource",
             @"FMDevicesListDataSource",
+            @"FindMy.FMLegacyDevicesListDataSource",
+            @"_TtC6FindMy29FMLegacyDevicesListDataSource",
+            @"FMLegacyDevicesListDataSource",
         ];
         SEL rowCountSelector = NSSelectorFromString(@"tableView:numberOfRowsInSection:");
 

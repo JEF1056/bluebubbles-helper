@@ -326,6 +326,101 @@ private func testFMIPManagerExtraction() {
            "class fmipManager must be extracted identically")
 }
 
+private struct MockEquatableFriend: Equatable {
+    let identifier: String
+    let contactHandles: [String]
+    let displayName: String
+}
+
+private final class MockFMFDataManagerWithInternalFriends {
+    let internalFriends: [MockEquatableFriend]
+    init(friends: [MockEquatableFriend]) {
+        self.internalFriends = friends
+    }
+}
+
+private final class MockClassFMFManager {
+    let dataManager: MockFMFDataManagerWithInternalFriends
+    init(friends: [MockEquatableFriend]) {
+        self.dataManager = MockFMFDataManagerWithInternalFriends(friends: friends)
+    }
+}
+
+private final class MockClassPeopleProvider {
+    let fmfManager: MockClassFMFManager
+    init(fmfManager: MockClassFMFManager) {
+        self.fmfManager = fmfManager
+    }
+}
+
+private final class MockDirectMediator {
+    let devicesProvider: MockClassDevicesProvider
+    let peopleProvider: MockClassPeopleProvider
+    let valueFlag: Int = 42
+    init(devicesProvider: MockClassDevicesProvider, peopleProvider: MockClassPeopleProvider) {
+        self.devicesProvider = devicesProvider
+        self.peopleProvider = peopleProvider
+    }
+}
+
+private func testFMFManagerAndDirectMediator() {
+    let fmipManager = MockClassFMIPManager()
+    let bob = MockEquatableFriend(
+        identifier: "bob@icloud.com",
+        contactHandles: ["+16266165776", "bob@icloud.com"],
+        displayName: "Bob Appleseed"
+    )
+    let alice = MockEquatableFriend(
+        identifier: "alice@icloud.com",
+        contactHandles: ["+15551112222"],
+        displayName: "Alice Example"
+    )
+    let fmfManager = MockClassFMFManager(friends: [alice, bob])
+    let mediator = MockDirectMediator(
+        devicesProvider: MockClassDevicesProvider(fmipManager: fmipManager),
+        peopleProvider: MockClassPeopleProvider(fmfManager: fmfManager)
+    )
+
+    assert(FindMyDeviceSnapshot.fmipManager(from: mediator) === fmipManager,
+           "direct mediator must resolve fmipManager without legacy devices data source")
+    assert(FindMyDeviceSnapshot.fmfManager(from: mediator) === fmfManager,
+           "direct mediator must resolve fmfManager")
+    assert(FindMyDeviceSnapshot.childObject(named: "peopleProvider", in: mediator) === mediator.peopleProvider,
+           "childObject must extract Swift class reference ivars")
+    assert(FindMyDeviceSnapshot.childObject(named: "valueFlag", in: mediator) == nil,
+           "childObject must ignore non-class value fields")
+
+    var matchedFriend: MockEquatableFriend?
+    var matchedManager: AnyObject?
+    let matchedPhone = FindMyDeviceSnapshot.withMatchingFriend(
+        in: mediator,
+        targets: ["(626) 616-5776"]
+    ) { manager, ptr in
+        matchedManager = manager
+        matchedFriend = ptr.assumingMemoryBound(to: MockEquatableFriend.self).pointee
+    }
+    assert(matchedPhone && matchedManager === fmfManager && matchedFriend == bob,
+           "withMatchingFriend must match phone suffix via dataManager.internalFriends and pass borrowed struct pointer")
+
+    matchedFriend = nil
+    let matchedName = FindMyDeviceSnapshot.withMatchingFriend(
+        in: mediator,
+        targets: ["Alice Example"]
+    ) { _, ptr in
+        matchedFriend = ptr.assumingMemoryBound(to: MockEquatableFriend.self).pointee
+    }
+    assert(matchedName && matchedFriend == alice,
+           "withMatchingFriend must fall back to display name matching")
+
+    let matchedMissing = FindMyDeviceSnapshot.withMatchingFriend(
+        in: mediator,
+        targets: ["+19998887777"]
+    ) { _, _ in
+        assertionFailure("non-matching target must not invoke callback")
+    }
+    assert(!matchedMissing, "withMatchingFriend must return false when no friend matches")
+}
+
 @main
 private enum FindMyDeviceSnapshotTests {
     static func main() {
@@ -334,6 +429,7 @@ private enum FindMyDeviceSnapshotTests {
         testUnidentifiableDeviceMakesResponsePartial()
         testPeopleRowsMetadataExtraction()
         testFMIPManagerExtraction()
+        testFMFManagerAndDirectMediator()
         print("PASS: FindMyDeviceSnapshotTests")
     }
 }

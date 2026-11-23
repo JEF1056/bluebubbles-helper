@@ -8,6 +8,7 @@
 
 @interface BlueBubblesHelper (Stickers)
 + (void)sendSticker:(NSDictionary *)data transaction:(NSString *)transaction;
++ (void)repositionSticker:(NSDictionary *)data transaction:(NSString *)transaction;
 @end
 
 // Chat guids actively allowed to send outgoing read receipts during an explicit
@@ -104,15 +105,46 @@ static void RichLinkStep(NSString *step, id result) {
             SendTransactionResponse(transaction, @{@"error": @"Chat does not have a pinningIdentifier!"});
             return YES;
         }
+        BOOL changed = NO;
         if (shouldPin) {
             if (![chatArr containsObject:pinningId]) {
                 [chatArr addObject:pinningId];
-                [controller setPinnedConversationIdentifiers:[chatArr copy] withUpdateReason:@"contextMenu"];
+                changed = YES;
             }
         } else {
             if ([chatArr containsObject:pinningId]) {
                 [chatArr removeObject:pinningId];
+                changed = YES;
+            }
+        }
+        if (changed) {
+            if ([controller respondsToSelector:@selector(setPinnedConversationIdentifiers:withUpdateReason:)]) {
                 [controller setPinnedConversationIdentifiers:[chatArr copy] withUpdateReason:@"contextMenu"];
+            } else if ([controller respondsToSelector:@selector(_setPinnedConversationIdentifiers:withChatMetadata:updateReason:shouldUpdateStores:)]) {
+                NSMutableDictionary *meta = ([controller respondsToSelector:@selector(chatMetadata)] && [controller chatMetadata] != nil)
+                    ? [[controller chatMetadata] mutableCopy]
+                    : [NSMutableDictionary dictionary];
+                if (shouldPin) {
+                    if ([controller respondsToSelector:@selector(_metadataDictionaryForChat:)]) {
+                        id chatMeta = [controller _metadataDictionaryForChat:chat];
+                        if (chatMeta != nil) {
+                            meta[pinningId] = chatMeta;
+                        }
+                    }
+                } else {
+                    [meta removeObjectForKey:pinningId];
+                }
+                [controller _setPinnedConversationIdentifiers:[chatArr copy] withChatMetadata:[meta copy] updateReason:@"contextMenu" shouldUpdateStores:YES];
+            } else if ([controller respondsToSelector:@selector(setPinnedChats:withUpdateReason:)]) {
+                IMChatRegistry *registry = [IMChatRegistry sharedInstance];
+                NSMutableArray<IMChat *> *pinnedChats = [NSMutableArray arrayWithCapacity:chatArr.count];
+                for (NSString *pid in chatArr) {
+                    IMChat *resolved = [pid isEqualToString:pinningId] ? chat : ([registry respondsToSelector:@selector(existingChatWithPinningIdentifier:)] ? [registry existingChatWithPinningIdentifier:pid] : nil);
+                    if (resolved != nil) {
+                        [pinnedChats addObject:resolved];
+                    }
+                }
+                [controller setPinnedChats:[pinnedChats copy] withUpdateReason:@"contextMenu"];
             }
         }
         SendTransactionResponse(transaction, @{@"pinnedChatGuids": [self getPinnedChatGuids]});
@@ -122,6 +154,9 @@ static void RichLinkStep(NSString *step, id result) {
         return YES;
     } else if ([event isEqualToString:@"send-sticker"]) {
         [BlueBubblesHelper sendSticker:(data) transaction:(transaction)];
+        return YES;
+    } else if ([event isEqualToString:@"reposition-sticker"]) {
+        [BlueBubblesHelper repositionSticker:(data) transaction:(transaction)];
         return YES;
     } else if ([event isEqualToString:@"set-nickname-info"]) {
         NSString *displayName = [data[@"displayName"] isKindOfClass:[NSString class]] && [data[@"displayName"] length] > 0 ? data[@"displayName"] : nil;
@@ -190,20 +225,42 @@ static void RichLinkStep(NSString *step, id result) {
         if (imageData != nil) {
             // Copy bytes into the path Apple expects so the avatar persists across syncs.
             NSString *destPath = [IMNickname uniqueFilePathForWritingImageData];
+            NSString *targetPath = destPath ?: resolvedAvatarPath;
             NSError *writeError = nil;
-            avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageData:imageData imageFilePath:(destPath ?: resolvedAvatarPath) error:&writeError];
+            if ([IMNicknameAvatarImage instancesRespondToSelector:@selector(initWithImageName:imageData:imageFilePath:sensitivityAnalysis:error:)]) {
+                avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageData:imageData imageFilePath:targetPath sensitivityAnalysis:nil error:&writeError];
+            } else if ([IMNicknameAvatarImage instancesRespondToSelector:@selector(initWithImageName:imageData:imageFilePath:error:)]) {
+                avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageData:imageData imageFilePath:targetPath error:&writeError];
+            }
             if (avatar == nil && resolvedAvatarPath != nil) {
-                avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageFilePath:resolvedAvatarPath];
+                if ([IMNicknameAvatarImage instancesRespondToSelector:@selector(initWithImageName:imageFilePath:sensitivityAnalysis:)]) {
+                    avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageFilePath:resolvedAvatarPath sensitivityAnalysis:nil];
+                } else if ([IMNicknameAvatarImage instancesRespondToSelector:@selector(initWithImageName:imageFilePath:)]) {
+                    avatar = [[IMNicknameAvatarImage alloc] initWithImageName:displayName imageFilePath:resolvedAvatarPath];
+                }
             }
         }
 
-        IMNickname *nickname = [[IMNickname alloc] initWithFirstName:firstName lastName:lastName avatar:avatar];
+        IMNickname *nickname = nil;
+        if ([IMNickname instancesRespondToSelector:@selector(initWithFirstName:lastName:avatar:pronouns:)]) {
+            nickname = [[IMNickname alloc] initWithFirstName:firstName lastName:lastName avatar:avatar pronouns:nil];
+        } else if ([IMNickname instancesRespondToSelector:@selector(initWithFirstName:lastName:avatar:)]) {
+            nickname = [[IMNickname alloc] initWithFirstName:firstName lastName:lastName avatar:avatar];
+        }
+        if (nickname == nil) {
+            if (transaction != nil) {
+                SendTransactionResponse(transaction, @{@"error": @"Failed to initialize IMNickname"});
+            }
+            return YES;
+        }
         [nickname setDisplayName:displayName];
 
         IMNicknameController *controller = [IMNicknameController sharedInstance];
         [controller updatePersonalNickname:nickname];
         // Persist locally so Messages.app picks it up on next launch as well as immediately.
-        if ([controller respondsToSelector:@selector(_updateLocalNicknameStore)]) {
+        if ([controller respondsToSelector:@selector(updateLocalNicknameStore)]) {
+            [controller updateLocalNicknameStore];
+        } else if ([controller respondsToSelector:@selector(_updateLocalNicknameStore)]) {
             [controller _updateLocalNicknameStore];
         }
 
@@ -623,10 +680,6 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
 
 #pragma mark - Sticker sending & iCloud Sticker store XPC
 
-@interface BlueBubblesHelper (Stickers)
-+ (void)sendSticker:(NSDictionary *)data transaction:(NSString *)transaction;
-@end
-
 @implementation BlueBubblesHelper (Stickers)
 
 + (NSDictionary *)normalizedStickerUserInfo:(NSDictionary *)data filename:(NSString *)filename {
@@ -642,7 +695,10 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
     for (NSString *key in aliases) {
         id val = raw[key] ?: raw[aliases[key]];
         if ([val isKindOfClass:[NSNumber class]] || [val isKindOfClass:[NSString class]]) {
-            info[key] = @([val doubleValue]);
+            double d = [val doubleValue];
+            if (isfinite(d)) {
+                info[key] = @(d);
+            }
         }
     }
     if (info.count > 0) {
@@ -795,7 +851,7 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
             dispatch_async(dispatch_get_main_queue(), ^{
                 [chat sendMessage:messageToSend];
                 if (transaction != nil) {
-                    SendTransactionResponse(transaction, @{@"identifier": [[chat lastSentMessage] guid] ?: [NSNull null]});
+                    SendTransactionResponse(transaction, @{@"identifier": [messageToSend guid] ?: [[chat lastSentMessage] guid] ?: [NSNull null]});
                 }
             });
         }];
@@ -803,6 +859,142 @@ ZKSwizzleInterface(BBH_IMChatRegistry_Receipts, IMChatRegistry, NSObject)
     }
 
     [BlueBubblesHelper sendMessage:data transfers:@[transferGuid] attributedString:attachmentStr transaction:transaction];
+}
+
+static BOOL BBFiniteNumber(id val, double *out) {
+    if ([val isKindOfClass:[NSNumber class]]) {
+        if (CFGetTypeID((__bridge CFTypeRef)val) == CFBooleanGetTypeID()) return NO;
+        double d = [val doubleValue];
+        if (!isfinite(d)) return NO;
+        if (out) *out = d;
+        return YES;
+    }
+    if ([val isKindOfClass:[NSString class]]) {
+        const char *s = [(NSString *)val UTF8String];
+        if (s == NULL || *s == '\0') return NO;
+        char *end = NULL;
+        double d = strtod(s, &end);
+        if (end == s || *end != '\0' || !isfinite(d)) return NO;
+        if (out) *out = d;
+        return YES;
+    }
+    return NO;
+}
+
+static NSMutableDictionary<NSString *, NSNumber *> *_lastSpvByTransfer = nil;
+
++ (void)repositionSticker:(NSDictionary *)data transaction:(NSString *)transaction {
+    if (![data isKindOfClass:[NSDictionary class]]) {
+        if (transaction != nil) SendTransactionResponse(transaction, @{@"error": @"Invalid parameters for reposition-sticker"});
+        return;
+    }
+    NSString *chatGuid = [data[@"chatGuid"] isKindOfClass:[NSString class]] ? data[@"chatGuid"] : nil;
+    NSString *messageGuid = [data[@"messageGuid"] isKindOfClass:[NSString class]] ? data[@"messageGuid"] : nil;
+    double xScalar = 0, yScalar = 0, scale = 0, rotation = 0, parentPreviewWidth = 0;
+    if (chatGuid.length == 0 || messageGuid.length == 0 ||
+        !BBFiniteNumber(data[@"xScalar"], &xScalar) ||
+        !BBFiniteNumber(data[@"yScalar"], &yScalar) ||
+        !BBFiniteNumber(data[@"scale"], &scale) || scale <= 0 ||
+        !BBFiniteNumber(data[@"rotation"], &rotation) ||
+        !BBFiniteNumber(data[@"parentPreviewWidth"], &parentPreviewWidth) || parentPreviewWidth <= 0) {
+        if (transaction != nil) {
+            SendTransactionResponse(transaction, @{@"error": @"Invalid parameters for reposition-sticker"});
+        }
+        return;
+    }
+
+    double rawClientSpv = 0;
+    NSInteger clientSpv = BBFiniteNumber(data[@"currentSpv"], &rawClientSpv) ? (NSInteger)llround(rawClientSpv) : 0;
+
+    IMChat *chat = [[BlueBubblesHelper sharedInstance] getIMChatFromGuid:chatGuid transaction:transaction];
+    if (chat == nil) return;
+
+    [BlueBubblesHelper getMessageItem:chat :messageGuid completionBlock:^(IMMessage *sticker) {
+        if (sticker == nil) {
+            if (transaction != nil) SendTransactionResponse(transaction, @{@"error": @"Sticker message not found"});
+            return;
+        }
+        if (![sticker isFromMe]) {
+            if (transaction != nil) SendTransactionResponse(transaction, @{@"error": @"Cannot reposition a sticker not sent by you"});
+            return;
+        }
+        NSString *transferGuid = [sticker.fileTransferGUIDs.firstObject isKindOfClass:[NSString class]] ? sticker.fileTransferGUIDs.firstObject : nil;
+        if (transferGuid.length == 0) {
+            if (transaction != nil) SendTransactionResponse(transaction, @{@"error": @"Sticker message has no file transfer"});
+            return;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            IMFileTransfer *transfer = [[IMFileTransferCenter sharedInstance] transferForGUID:transferGuid];
+            NSDictionary *rawOld = [transfer respondsToSelector:@selector(stickerUserInfo)] ? [transfer stickerUserInfo] : nil;
+            NSDictionary *old = [rawOld isKindOfClass:[NSDictionary class]] ? rawOld : nil;
+
+            NSInteger transferSpv = [old[@"spv"] respondsToSelector:@selector(integerValue)] ? [old[@"spv"] integerValue] : 0;
+            NSInteger cachedSpv = 0;
+            @synchronized(self) {
+                NSNumber *cached = _lastSpvByTransfer[transferGuid];
+                cachedSpv = [cached respondsToSelector:@selector(integerValue)] ? [cached integerValue] : 0;
+            }
+            NSInteger maxSpv = MAX(MAX(transferSpv, clientSpv), cachedSpv);
+            NSInteger nextSpv = MAX(maxSpv, 0) + 1;
+
+            id sli = (old[@"sli"] != nil && old[@"sli"] != [NSNull null]) ? old[@"sli"] : @0;
+            id sai = (old[@"sai"] != nil && old[@"sai"] != [NSNull null]) ? old[@"sai"] : @0;
+            NSMutableDictionary *meta = [@{
+                @"sxs": @(xScalar),
+                @"sys": @(yScalar),
+                @"ssa": @(scale),
+                @"sro": @(rotation),
+                @"spw": @(parentPreviewWidth),
+                @"spv": @(nextSpv),
+                @"sli": sli,
+                @"sai": sai,
+            } mutableCopy];
+
+            IMMessage *m = [sticker copy];
+            if (m == nil) {
+                if (transaction != nil) SendTransactionResponse(transaction, @{@"error": @"Failed to copy sticker message"});
+                return;
+            }
+            NSDictionary *summaryInfo = @{@"spui": meta};
+            if ([m respondsToSelector:@selector(_messageSummaryInfo:)]) {
+                [m _messageSummaryInfo:summaryInfo];
+            } else if ([m._imMessageItem respondsToSelector:@selector(setMessageSummaryInfo:)]) {
+                [m._imMessageItem setMessageSummaryInfo:summaryInfo];
+            } else {
+                if (transaction != nil) SendTransactionResponse(transaction, @{@"error": @"Message summary setter unavailable"});
+                return;
+            }
+
+            NSString *errMsg = nil;
+            @try {
+                if ([chat respondsToSelector:@selector(repositionSticker:associatedChatItem:)]) {
+                    [chat repositionSticker:m associatedChatItem:nil];
+                } else {
+                    errMsg = @"repositionSticker selector unavailable";
+                }
+            } @catch (NSException *ex) {
+                DLog("BLUEBUBBLESHELPER: Reposition sticker exception: %@", ex);
+                errMsg = ex.reason ?: @"Reposition sticker failed";
+            }
+
+            if (errMsg == nil) {
+                @synchronized(self) {
+                    if (_lastSpvByTransfer == nil) _lastSpvByTransfer = [NSMutableDictionary dictionary];
+                    _lastSpvByTransfer[transferGuid] = @(nextSpv);
+                }
+                if ([transfer respondsToSelector:@selector(setStickerUserInfo:)]) {
+                    NSMutableDictionary *updated = old ? [old mutableCopy] : [NSMutableDictionary dictionary];
+                    [updated addEntriesFromDictionary:meta];
+                    [transfer setStickerUserInfo:[updated copy]];
+                }
+            }
+
+            if (transaction != nil) {
+                SendTransactionResponse(transaction, errMsg != nil ? @{@"error": errMsg} : @{@"identifier": messageGuid});
+            }
+        });
+    }];
 }
 
 @end

@@ -3,7 +3,7 @@ import Foundation
 
 enum FindMyDeviceSnapshot {
     static func response(from dataSource: Any) -> [String: Any] {
-        guard let mediator = child(named: "mediator", in: dataSource) else {
+        guard let mediator = resolveMediator(from: dataSource) else {
             return errorResponse("Find My Devices mediator is unavailable")
         }
         guard let devicesProvider = child(named: "devicesProvider", in: mediator) else {
@@ -41,7 +41,7 @@ enum FindMyDeviceSnapshot {
     }
 
     static func fmipManager(from dataSource: Any) -> AnyObject? {
-        guard let mediator = child(named: "mediator", in: dataSource),
+        guard let mediator = resolveMediator(from: dataSource),
               let devicesProvider = child(named: "devicesProvider", in: mediator),
               let manager = child(named: "fmipManager", in: devicesProvider) else {
             return nil
@@ -51,6 +51,38 @@ enum FindMyDeviceSnapshot {
             return nil
         }
         return manager as AnyObject
+    }
+
+    static func fmfManager(from container: Any) -> AnyObject? {
+        guard let mediator = resolveMediator(from: container),
+              let peopleProvider = child(named: "peopleProvider", in: mediator),
+              let manager = child(named: "fmfManager", in: peopleProvider) else {
+            return nil
+        }
+        guard Mirror(reflecting: manager).displayStyle == .class else {
+            return nil
+        }
+        return manager as AnyObject
+    }
+
+    static func childObject(named name: String, in object: Any) -> AnyObject? {
+        guard let value = child(named: name, in: object),
+              Mirror(reflecting: value).displayStyle == .class else {
+            return nil
+        }
+        return value as AnyObject
+    }
+
+    private static func resolveMediator(from container: Any) -> Any? {
+        if let mediator = child(named: "mediator", in: container) {
+            return mediator
+        }
+        if child(named: "peopleProvider", in: container) != nil ||
+           child(named: "devicesProvider", in: container) != nil ||
+           child(named: "conditionProvider", in: container) != nil {
+            return container
+        }
+        return nil
     }
 
     private static func errorResponse(_ message: String) -> [String: Any] {
@@ -306,15 +338,14 @@ enum FindMyDeviceSnapshot {
         }
 
         var friendTokenGroups: [[String]] = []
-        if let mediator = child(named: "mediator", in: dataSource) {
+        if let mediator = resolveMediator(from: dataSource) {
             result["mediator"] = mediator
             if let conditionProvider = child(named: "conditionProvider", in: mediator) {
                 result["conditionProvider"] = conditionProvider
             }
             if let peopleProvider = child(named: "peopleProvider", in: mediator),
-               let fmfManager = child(named: "fmfManager", in: peopleProvider),
-               let friends = child(named: "friends", in: fmfManager) {
-                for friend in collectionElements(friends) {
+               let fmfManager = child(named: "fmfManager", in: peopleProvider) {
+                for friend in fmfFriends(from: fmfManager) {
                     let tokens = collectStringTokens(from: friend, maxDepth: 5)
                     if !tokens.isEmpty {
                         friendTokenGroups.append(tokens)
@@ -347,6 +378,153 @@ enum FindMyDeviceSnapshot {
         return result
     }
 
+    static func withMatchingFriend(
+        in container: Any,
+        targets: [String],
+        body: (AnyObject, UnsafeRawPointer) -> Void
+    ) -> Bool {
+        let cleanedTargets = targets.compactMap { normalizedMatchString($0) }
+        guard !cleanedTargets.isEmpty,
+              let manager = fmfManager(from: container) else {
+            return false
+        }
+
+        let friends = fmfFriends(from: manager)
+        guard !friends.isEmpty else {
+            return false
+        }
+
+        // Pass 1: exact handle/phone/email match against identifier, contactHandles, pushIdentifiers.
+        var matchedFriend: Any?
+        for friend in friends {
+            let handleTokens = friendHandleTokens(from: friend)
+            if handleTokens.contains(where: { token in
+                cleanedTargets.contains(where: { target in
+                    matchToken(token, against: target, allowNameMatch: false)
+                })
+            }) {
+                matchedFriend = friend
+                break
+            }
+        }
+
+        // Pass 2: fallback to displayName / shortName / general string tokens.
+        if matchedFriend == nil {
+            for friend in friends {
+                let tokens = collectStringTokens(from: friend, maxDepth: 4)
+                if tokens.contains(where: { token in
+                    cleanedTargets.contains(where: { target in
+                        matchToken(token, against: target, allowNameMatch: true)
+                    })
+                }) {
+                    matchedFriend = friend
+                    break
+                }
+            }
+        }
+
+        guard let friend = matchedFriend,
+              let equatableFriend = friend as? any Equatable else {
+            return false
+        }
+
+        openEquatablePointer(equatableFriend) { friendPtr in
+            body(manager, friendPtr)
+        }
+        return true
+    }
+
+    private static func openEquatablePointer<T: Equatable>(
+        _ value: T,
+        _ body: (UnsafeRawPointer) -> Void
+    ) {
+        withUnsafePointer(to: value) { ptr in
+            body(UnsafeRawPointer(ptr))
+        }
+    }
+
+    private static func fmfFriends(from fmfManager: Any) -> [Any] {
+        // FMFCore.FMFManager stores friends on dataManager.internalFriends; keep .friends fallback for mocks/older macOS.
+        if let dataManager = child(named: "dataManager", in: fmfManager),
+           let internalFriends = child(named: "internalFriends", in: dataManager) {
+            let elements = collectionElements(internalFriends)
+            if !elements.isEmpty {
+                return elements
+            }
+        }
+        if let friends = child(named: "friends", in: fmfManager) {
+            return collectionElements(friends)
+        }
+        return []
+    }
+
+    private static func friendHandleTokens(from friend: Any) -> [String] {
+        var tokens: [String] = []
+        var seen: Set<String> = []
+        for field in ["identifier", "contactHandles", "pushIdentifiers", "handle", "handles", "aliases"] {
+            guard let value = child(named: field, in: friend) else {
+                continue
+            }
+            for item in collectionElements(value) {
+                if let str = string(item), seen.insert(str).inserted {
+                    tokens.append(str)
+                }
+            }
+        }
+        return tokens
+    }
+
+    private static func normalizedMatchString(_ value: String) -> String? {
+        var trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("mailto:") {
+            trimmed = String(trimmed.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if lower.hasPrefix("tel:") {
+            trimmed = String(trimmed.dropFirst(4)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let collapsed = trimmed.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return collapsed.isEmpty ? nil : collapsed
+    }
+
+    private static func digitsOnly(_ value: String) -> String {
+        return String(value.unicodeScalars.filter { CharacterSet.decimalDigits.contains($0) })
+    }
+
+    private static func hasLetters(_ value: String) -> Bool {
+        return value.unicodeScalars.contains { CharacterSet.letters.contains($0) }
+    }
+
+    private static func matchToken(_ candidate: String, against target: String, allowNameMatch: Bool) -> Bool {
+        guard let cleanCandidate = normalizedMatchString(candidate),
+              let cleanTarget = normalizedMatchString(target) else {
+            return false
+        }
+        let compareOptions: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+        if cleanCandidate.compare(cleanTarget, options: compareOptions) == .orderedSame {
+            return true
+        }
+        if !cleanCandidate.contains("@"),
+           !cleanTarget.contains("@"),
+           !hasLetters(cleanCandidate),
+           !hasLetters(cleanTarget) {
+            let candDigits = digitsOnly(cleanCandidate)
+            let targetDigits = digitsOnly(cleanTarget)
+            if candDigits.count >= 7 && targetDigits.count >= 7 {
+                if candDigits == targetDigits {
+                    return true
+                }
+                if min(candDigits.count, targetDigits.count) >= 10 &&
+                   (candDigits.hasSuffix(targetDigits) || targetDigits.hasSuffix(candDigits)) {
+                    return true
+                }
+            }
+        }
+        if allowNameMatch && cleanTarget.count >= 3 && hasLetters(cleanTarget) && !cleanTarget.contains("@") {
+            return cleanCandidate.range(of: cleanTarget, options: compareOptions) != nil
+        }
+        return false
+    }
+
     private static func collectionElements(_ value: Any?) -> [Any] {
         guard let unwrappedValue = unwrapped(value) else {
             return []
@@ -354,6 +532,12 @@ enum FindMyDeviceSnapshot {
         let mirror = Mirror(reflecting: unwrappedValue)
         if mirror.displayStyle == .collection || mirror.displayStyle == .set {
             return mirror.children.map { $0.value }
+        }
+        if mirror.displayStyle == .dictionary {
+            return mirror.children.compactMap { entry in
+                let pairMirror = Mirror(reflecting: entry.value)
+                return pairMirror.children.dropFirst().first?.value
+            }
         }
         return [unwrappedValue]
     }
@@ -480,4 +664,60 @@ public func blueBubblesFindMyCopyPeopleRowsMetadata(
     let dataSource = Unmanaged<AnyObject>.fromOpaque(dataSourcePointer).takeUnretainedValue()
     let metadata = FindMyDeviceSnapshot.peopleRowsMetadata(from: dataSource)
     return Unmanaged.passRetained(metadata as NSDictionary).toOpaque()
+}
+
+@_cdecl("BlueBubblesFindMyCopyChildObject")
+public func blueBubblesFindMyCopyChildObject(
+    _ objectPointer: UnsafeMutableRawPointer?,
+    _ childNamePointer: UnsafePointer<CChar>?
+) -> UnsafeMutableRawPointer? {
+    guard let objectPointer, let childNamePointer else {
+        return nil
+    }
+    let object = Unmanaged<AnyObject>.fromOpaque(objectPointer).takeUnretainedValue()
+    let childName = String(cString: childNamePointer)
+    guard let childObject = FindMyDeviceSnapshot.childObject(named: childName, in: object) else {
+        return nil
+    }
+    return Unmanaged.passRetained(childObject).toOpaque()
+}
+
+@_cdecl("BlueBubblesFindMyCopyFMFManager")
+public func blueBubblesFindMyCopyFMFManager(
+    _ containerPointer: UnsafeMutableRawPointer?
+) -> UnsafeMutableRawPointer? {
+    guard let containerPointer else {
+        return nil
+    }
+    let container = Unmanaged<AnyObject>.fromOpaque(containerPointer).takeUnretainedValue()
+    guard let manager = FindMyDeviceSnapshot.fmfManager(from: container) else {
+        return nil
+    }
+    return Unmanaged.passRetained(manager).toOpaque()
+}
+
+public typealias BBFindMyFriendActionCallback = @convention(c) (
+    UnsafeMutableRawPointer,
+    UnsafeRawPointer,
+    UnsafeMutableRawPointer?
+) -> Void
+
+@_cdecl("BlueBubblesFindMyWithMatchingFriend")
+public func blueBubblesFindMyWithMatchingFriend(
+    _ containerPointer: UnsafeMutableRawPointer?,
+    _ targetsPointer: UnsafeMutableRawPointer?,
+    _ callback: BBFindMyFriendActionCallback?,
+    _ context: UnsafeMutableRawPointer?
+) -> Bool {
+    guard let containerPointer, let targetsPointer, let callback else {
+        return false
+    }
+    let container = Unmanaged<AnyObject>.fromOpaque(containerPointer).takeUnretainedValue()
+    guard let targets = Unmanaged<AnyObject>.fromOpaque(targetsPointer).takeUnretainedValue() as? [String] else {
+        return false
+    }
+    return FindMyDeviceSnapshot.withMatchingFriend(in: container, targets: targets) { manager, friendPtr in
+        let managerPtr = Unmanaged.passUnretained(manager).toOpaque()
+        callback(managerPtr, friendPtr, context)
+    }
 }
