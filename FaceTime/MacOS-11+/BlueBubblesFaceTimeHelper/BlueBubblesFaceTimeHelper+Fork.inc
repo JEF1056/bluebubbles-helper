@@ -485,8 +485,8 @@ static BOOL BBIsSelfLayerClassName(NSString *clsName) {
            ([clsName rangeOfString:@"LocalVideo" options:NSCaseInsensitiveSearch].location != NSNotFound);
 }
 
-static void BBAppendLayerTree(CALayer *layer, NSUInteger depth, NSMutableString *treeOut, BOOL hide, NSUInteger *matchedCount) {
-    if (layer == nil || depth > 32) return;
+static void BBCheckSingleLayer(CALayer *layer, NSUInteger depth, NSMutableString *treeOut, BOOL hide, NSUInteger *matchedCount) {
+    if (layer == nil) return;
     NSString *clsName = NSStringFromClass([layer class]) ?: @"";
     if (treeOut != nil) {
         for (NSUInteger i = 0; i < depth; i++) [treeOut appendString:@"  "];
@@ -505,6 +505,34 @@ static void BBAppendLayerTree(CALayer *layer, NSUInteger depth, NSMutableString 
             [BBHiddenSelfLayers() removeObject:layer];
         }
     }
+}
+
+static void BBCheckUnhostedLayers(CALayer *layer, NSUInteger depth, NSMutableString *treeOut, BOOL hide, NSUInteger *matchedCount) {
+    if (layer == nil || depth > 32) return;
+    BBCheckSingleLayer(layer, depth, treeOut, hide, matchedCount);
+    for (CALayer *sublayer in [layer.sublayers copy]) {
+        id del = sublayer.delegate;
+        if (del == nil || ![del isKindOfClass:[NSView class]]) {
+            BBCheckUnhostedLayers(sublayer, depth + 1, treeOut, hide, matchedCount);
+        }
+    }
+}
+
+static void BBCheckUnhostedUILayers(CALayer *layer, NSUInteger depth, NSMutableString *treeOut, BOOL hide, NSUInteger *matchedCount) {
+    if (layer == nil || depth > 32) return;
+    BBCheckSingleLayer(layer, depth, treeOut, hide, matchedCount);
+    Class uiViewCls = NSClassFromString(@"UIView");
+    for (CALayer *sublayer in [layer.sublayers copy]) {
+        id del = sublayer.delegate;
+        if (del == nil || (uiViewCls != Nil && ![del isKindOfClass:uiViewCls])) {
+            BBCheckUnhostedUILayers(sublayer, depth + 1, treeOut, hide, matchedCount);
+        }
+    }
+}
+
+static void BBAppendLayerTree(CALayer *layer, NSUInteger depth, NSMutableString *treeOut, BOOL hide, NSUInteger *matchedCount) {
+    if (layer == nil || depth > 32) return;
+    BBCheckSingleLayer(layer, depth, treeOut, hide, matchedCount);
     for (CALayer *sublayer in [layer.sublayers copy]) {
         BBAppendLayerTree(sublayer, depth + 1, treeOut, hide, matchedCount);
     }
@@ -531,7 +559,7 @@ static void BBWalkViewTree(NSView *view, NSUInteger depth, NSMutableString *tree
         }
     }
     if (view.layer != nil) {
-        BBAppendLayerTree(view.layer, depth + 1, treeOut, hide, matchedCount);
+        BBCheckUnhostedLayers(view.layer, depth + 1, treeOut, hide, matchedCount);
     }
     for (NSView *subview in [view.subviews copy]) {
         BBWalkViewTree(subview, depth + 1, treeOut, hide, matchedCount);
@@ -577,7 +605,7 @@ static void BBWalkUIViewTree(id uiView, NSUInteger depth, NSMutableString *treeO
         }
     }
     if (layer != nil) {
-        BBAppendLayerTree(layer, depth + 1, treeOut, hide, matchedCount);
+        BBCheckUnhostedUILayers(layer, depth + 1, treeOut, hide, matchedCount);
     }
     if ([uiView respondsToSelector:@selector(subviews)]) {
         NSArray *subs = ((NSArray * (*)(id, SEL))objc_msgSend)(uiView, @selector(subviews));
@@ -738,14 +766,13 @@ static void BBUpdateSelfViewMonitorForCallActive(BOOL isActive) {
     BOOL seenBefore = NO;
     @synchronized(seenNonDisconnectedCalls) {
         if (callStatus != 6) {
-            if ([seenNonDisconnectedCalls count] >= 512) {
-                [seenNonDisconnectedCalls removeAllObjects];
-            }
             if (resolvedCallUUID != nil) [seenNonDisconnectedCalls addObject:resolvedCallUUID];
             if (uniqueProxyIdentifier != nil) [seenNonDisconnectedCalls addObject:uniqueProxyIdentifier];
         } else {
             seenBefore = (resolvedCallUUID != nil && [seenNonDisconnectedCalls containsObject:resolvedCallUUID]) ||
                          (uniqueProxyIdentifier != nil && [seenNonDisconnectedCalls containsObject:uniqueProxyIdentifier]);
+            if (resolvedCallUUID != nil) [seenNonDisconnectedCalls removeObject:resolvedCallUUID];
+            if (uniqueProxyIdentifier != nil) [seenNonDisconnectedCalls removeObject:uniqueProxyIdentifier];
         }
     }
     if (callStatus == 6) {
@@ -1124,7 +1151,7 @@ static BOOL BBConversationHasActiveLocalCall(NSString *groupUUIDStr) {
                 return c;
             }
         }
-        if (fallbackCall == nil) {
+        if (fallbackCall == nil && callUUID == nil && convGroupUUID == nil) {
             fallbackCall = c;
         }
     }
@@ -1476,7 +1503,9 @@ static BOOL BBConversationHasActiveLocalCall(NSString *groupUUIDStr) {
                 NSString *cGroupUUID = [[candidate groupUUID] UUIDString];
                 NSString *cUUID = [candidate respondsToSelector:@selector(UUID)] ? [[candidate UUID] UUIDString] : nil;
                 NSString *cUrl = [[[candidate link] URL] absoluteString];
-                if (([targetConvUUID length] > 0 && ([cGroupUUID isEqualToString:targetConvUUID] || [cUUID isEqualToString:targetConvUUID])) ||
+                BOOL matchGroup = [cGroupUUID length] > 0 && [cGroupUUID caseInsensitiveCompare:targetConvUUID] == NSOrderedSame;
+                BOOL matchUUID = [cUUID length] > 0 && [cUUID caseInsensitiveCompare:targetConvUUID] == NSOrderedSame;
+                if (([targetConvUUID length] > 0 && (matchGroup || matchUUID)) ||
                     ([targetUrl length] > 0 && [cUrl isEqualToString:targetUrl])) {
                     convo = candidate;
                     break;
@@ -1543,7 +1572,7 @@ static BOOL BBConversationHasActiveLocalCall(NSString *groupUUIDStr) {
                 NSString *lUrl = [[link URL] absoluteString];
                 NSString *lGroupUUID = [[link groupUUID] UUIDString];
                 BOOL matchesUrl = [resolvedUrl length] > 0 && [lUrl isEqualToString:resolvedUrl];
-                BOOL matchesGroup = [resolvedGroupUUID length] > 0 && [lGroupUUID isEqualToString:resolvedGroupUUID];
+                BOOL matchesGroup = [resolvedGroupUUID length] > 0 && [lGroupUUID caseInsensitiveCompare:resolvedGroupUUID] == NSOrderedSame;
                 if ((matchesUrl || matchesGroup) && ![linksToInvalidate containsObject:link]) {
                     [linksToInvalidate addObject:link];
                 }
@@ -1586,7 +1615,7 @@ static BOOL BBConversationHasActiveLocalCall(NSString *groupUUIDStr) {
                         [retainedClients removeObject:xpcClient];
                         xpcClient = nil;
                     }
-                    if (ok || err == nil) anyInvalidated = YES;
+                    if (ok && err == nil) anyInvalidated = YES;
                     remainingLinks--;
                     if (remainingLinks == 0) finishReply();
                 });
@@ -1599,7 +1628,7 @@ static BOOL BBConversationHasActiveLocalCall(NSString *groupUUIDStr) {
                     [retainedClients addObject:xpcClient];
                     [xpcClient invalidateLink:link completionHandler:onDone];
                 } else {
-                    onDone(NO, nil);
+                    onDone(NO, [NSError errorWithDomain:@"BlueBubbles" code:1 userInfo:@{NSLocalizedDescriptionKey: @"XPC client unavailable"}]);
                 }
             }
         }
@@ -1900,7 +1929,7 @@ static BOOL BBConversationHasActiveLocalCall(NSString *groupUUIDStr) {
                         [retainedClients removeObject:xpcClient];
                         xpcClient = nil;
                     }
-                    if (ok || err == nil) removedCount++;
+                    if (ok && err == nil) removedCount++;
                     remainingLinks--;
                     if (remainingLinks == 0) finishReply();
                 });
@@ -1913,7 +1942,7 @@ static BOOL BBConversationHasActiveLocalCall(NSString *groupUUIDStr) {
                     [retainedClients addObject:xpcClient];
                     [xpcClient invalidateLink:link completionHandler:onDone];
                 } else {
-                    onDone(NO, [NSError errorWithDomain:@"BlueBubbles" code:1 userInfo:nil]);
+                    onDone(NO, [NSError errorWithDomain:@"BlueBubbles" code:1 userInfo:@{NSLocalizedDescriptionKey: @"XPC client unavailable"}]);
                 }
             }
         }

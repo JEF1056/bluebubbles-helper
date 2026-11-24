@@ -39,6 +39,7 @@
 - (void)replayCurrentCallsToController:(NetworkController *)controller;
 - (void)initializeNetworkController;
 - (void)handleMessage:(NetworkController *)controller message:(NSString *)message;
+- (TUCall *)findReadyPulledCallInCallCenter:(TUCallCenter *)callCenter callUUID:(NSString *)callUUID conversationGroupUUID:(NSString *)convGroupUUID;
 @end
 
 #pragma mark - Test Doubles
@@ -1102,6 +1103,7 @@ static void TestCallTransferPullPushAndReplay(BLUEBUBBLESFACETIMEHELPER *helper)
         pulledFT.callStatus = 1;
         pulledFT.hostedOnCurrentDevice = YES;
         pulledFT.endpointOnCurrentDevice = YES;
+        pulledFT.conversationGroupUUID = handoffGroupUUID;
         gMockCalls[pulledFT.callUUID] = pulledFT;
     };
 
@@ -1165,6 +1167,41 @@ static void TestCallTransferPullPushAndReplay(BLUEBUBBLESFACETIMEHELPER *helper)
     ((void (*)(id, SEL, id))objc_msgSend)(delegate, @selector(conversationsChangedForConversationManager:), [[TUConversationManager alloc] init]);
     [gMockSharedNetworkController.sentMessages removeAllObjects];
     printf("PASS: TestCallTransferPullPushAndReplay\n");
+}
+
+static void TestConcurrentActiveCallFallbackPrevention(BLUEBUBBLESFACETIMEHELPER *helper) {
+    [gMockCalls removeAllObjects];
+    MockCall *activeCallA = [[MockCall alloc] init];
+    activeCallA.callUUID = @"call-a-active";
+    activeCallA.callStatus = 1;
+    activeCallA.hostedOnCurrentDevice = YES;
+    activeCallA.endpointOnCurrentDevice = YES;
+    activeCallA.conversationGroupUUID = [NSUUID UUID];
+    gMockCalls[activeCallA.callUUID] = activeCallA;
+
+    TUCallCenter *cc = [TUCallCenter sharedInstance];
+    // 1. Unrelated callUUID must NOT fall back to activeCallA
+    TUCall *foundCall = [helper findReadyPulledCallInCallCenter:cc callUUID:@"call-b-pending" conversationGroupUUID:nil];
+    AssertTrue(foundCall == nil, @"findReadyPulledCallInCallCenter must not return active Call A when searching for Call B UUID");
+
+    // 2. Unrelated conversationGroupUUID must NOT fall back to activeCallA
+    TUCall *foundGroup = [helper findReadyPulledCallInCallCenter:cc callUUID:nil conversationGroupUUID:[[NSUUID UUID] UUIDString]];
+    AssertTrue(foundGroup == nil, @"findReadyPulledCallInCallCenter must not return active Call A when searching for distinct convGroupUUID");
+
+    // 3. Exact callUUID match works
+    TUCall *exactCall = [helper findReadyPulledCallInCallCenter:cc callUUID:@"call-a-active" conversationGroupUUID:nil];
+    AssertTrue((id)exactCall == (id)activeCallA, @"findReadyPulledCallInCallCenter must find exact callUUID");
+
+    // 4. Exact group match works (case-insensitive)
+    TUCall *exactGroup = [helper findReadyPulledCallInCallCenter:cc callUUID:nil conversationGroupUUID:[[activeCallA.conversationGroupUUID UUIDString] lowercaseString]];
+    AssertTrue((id)exactGroup == (id)activeCallA, @"findReadyPulledCallInCallCenter must find exact convGroupUUID (case-insensitive)");
+
+    // 5. Fallback works when both callUUID and convGroupUUID are nil
+    TUCall *fallback = [helper findReadyPulledCallInCallCenter:cc callUUID:nil conversationGroupUUID:nil];
+    AssertTrue((id)fallback == (id)activeCallA, @"findReadyPulledCallInCallCenter only falls back when neither callUUID nor convGroupUUID specified");
+
+    [gMockCalls removeAllObjects];
+    printf("PASS: TestConcurrentActiveCallFallbackPrevention\n");
 }
 
 static void TestConversationParticipantCountChangeEmission(BLUEBUBBLESFACETIMEHELPER *helper) {
@@ -1448,6 +1485,7 @@ int main(void) {
         TestAnswerCallAndBatchedMessages(helper);
         TestAdmitAnyPendingMemberAndInvalidateTimeout(helper);
         TestCallTransferPullPushAndReplay(helper);
+        TestConcurrentActiveCallFallbackPrevention(helper);
         TestRemoteActiveConversationsAndPull(helper);
         TestSetMuted(helper);
         TestStartCall(helper);

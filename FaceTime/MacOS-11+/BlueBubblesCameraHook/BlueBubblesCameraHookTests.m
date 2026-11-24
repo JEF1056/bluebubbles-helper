@@ -360,7 +360,7 @@ int main(void) {
     assert(swapped1080 != NULL);
     CFRelease(swapped1080);
 
-    // 11b. 1080x1920 portrait letterboxed into 1280x720 landscape (slot 1 for seq=4; left edge pillarbox is dark, center is ~0xC8)
+    // 11b. 1080x1920 portrait scales upright into portrait dst (720x1280) with no CCW90 or pillarbox bars
     uint8_t *slot1_1080 = (uint8_t *)map2 + sizeof(TestRingHeader) + maxSlot1080;
     memset(slot1_1080, 0xC8, 1920u * 1080u);
     memset(slot1_1080 + 1920u * 1080u, 0x80, 1920u * 540u);
@@ -372,13 +372,15 @@ int main(void) {
     CMSampleBufferRef swappedPort = BBCameraHookCreateSwappedSampleBuffer(origLandscape, path1080);
     assert(swappedPort != NULL);
     CVImageBufferRef portImg = CMSampleBufferGetImageBuffer(swappedPort);
+    assert(CVPixelBufferGetWidth(portImg) == 720);
+    assert(CVPixelBufferGetHeight(portImg) == 1280);
     CVPixelBufferLockBaseAddress(portImg, kCVPixelBufferLock_ReadOnly);
     uint8_t *portY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(portImg, 0);
     size_t portStride = CVPixelBufferGetBytesPerRowOfPlane(portImg, 0);
-    uint8_t leftEdgeY = portY[360 * portStride + 4];
-    uint8_t centerY = portY[360 * portStride + 640];
+    uint8_t leftEdgeY = portY[640 * portStride + 4];
+    uint8_t centerY = portY[640 * portStride + 360];
     CVPixelBufferUnlockBaseAddress(portImg, kCVPixelBufferLock_ReadOnly);
-    assert(leftEdgeY < 40);
+    assert(leftEdgeY >= 190 && leftEdgeY <= 210);
     assert(centerY >= 190 && centerY <= 210);
     CFRelease(swappedPort);
 
@@ -587,18 +589,20 @@ int main(void) {
     assert(dlFd >= 0);
     struct stat dlSt;
     assert(fstat(dlFd, &dlSt) == 0 && (size_t)dlSt.st_size >= sizeof(TestRingHeader) + 320 * 240);
+    assert(S_ISREG(dlSt.st_mode));
+    assert((dlSt.st_mode & 0777) == 0644);
     void *dlMap = mmap(NULL, (size_t)dlSt.st_size, PROT_READ, MAP_SHARED, dlFd, 0);
     assert(dlMap != MAP_FAILED);
     TestRingHeader *dlHdr = (TestRingHeader *)dlMap;
     assert(dlHdr->magic == 0x42424352u);
     assert(dlHdr->width == 320);
     assert(dlHdr->height == 240);
-    assert(atomic_load_explicit(&dlHdr->seq, memory_order_acquire) == 2);
+    assert(atomic_load_explicit(&dlHdr->seq, memory_order_acquire) == 4);
     uint32_t dlOri = 0, dlFlags = 0;
     memcpy(&dlOri, dlHdr->reserved, 4);
     memcpy(&dlFlags, dlHdr->reserved + 4, 4);
     assert(dlOri == 2 && dlFlags == 1);
-    uint8_t *dlSlot2 = (uint8_t *)dlMap + sizeof(TestRingHeader) + (size_t)(2 % dlHdr->slots) * dlHdr->slot_bytes;
+    uint8_t *dlSlot2 = (uint8_t *)dlMap + sizeof(TestRingHeader) + (size_t)(4 % dlHdr->slots) * dlHdr->slot_bytes;
     assert(dlSlot2[0] == 0x5A);
     munmap(dlMap, (size_t)dlSt.st_size);
     close(dlFd);

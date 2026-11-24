@@ -175,38 +175,49 @@ static id sharedInstance = nil;
     if (data.length == 0) {
         return;
     }
-    if (_readBuffer == nil) {
-        _readBuffer = [[NSMutableData alloc] init];
+
+    NSMutableArray<NSString *> *messagesToDispatch = [NSMutableArray array];
+    @synchronized (self) {
+        if (sock != asyncSocket) {
+            return;
+        }
+        if (_readBuffer == nil) {
+            _readBuffer = [[NSMutableData alloc] init];
+        }
+        if (data.length > kBBMaxSocketMessageBytes || _readBuffer.length > kBBMaxSocketMessageBytes - data.length) {
+            DLog("BLUEBUBBLESFACETIMEHELPER: Incoming socket frame exceeded 64MB limit; disconnecting");
+            [_readBuffer setLength:0];
+            [sock disconnect];
+            return;
+        }
+        [_readBuffer appendData:data];
+
+        NSData *lfData = [GCDAsyncSocket LFData];
+        while (YES) {
+            NSRange nlRange = [_readBuffer rangeOfData:lfData options:0 range:NSMakeRange(0, _readBuffer.length)];
+            if (nlRange.location == NSNotFound) {
+                break;
+            }
+            NSData *frameData = [_readBuffer subdataWithRange:NSMakeRange(0, nlRange.location)];
+            [_readBuffer replaceBytesInRange:NSMakeRange(0, nlRange.location + 1) withBytes:NULL length:0];
+
+            if (frameData.length > 0 && ((const uint8_t *)frameData.bytes)[frameData.length - 1] == '\r') {
+                frameData = [frameData subdataWithRange:NSMakeRange(0, frameData.length - 1)];
+            }
+            if (frameData.length == 0) {
+                continue;
+            }
+
+            NSString *str = [[NSString alloc] initWithData:frameData encoding:NSUTF8StringEncoding];
+            if (str == nil || str.length == 0) {
+                DLog("BLUEBUBBLESFACETIMEHELPER: Dropping invalid UTF-8 socket frame (%lu bytes)", (unsigned long)frameData.length);
+                continue;
+            }
+            [messagesToDispatch addObject:str];
+        }
     }
-    if (data.length > kBBMaxSocketMessageBytes || _readBuffer.length > kBBMaxSocketMessageBytes - data.length) {
-        DLog("BLUEBUBBLESFACETIMEHELPER: Incoming socket frame exceeded 64MB limit; disconnecting");
-        [_readBuffer setLength:0];
-        [sock disconnect];
-        return;
-    }
-    [_readBuffer appendData:data];
 
-    NSData *lfData = [GCDAsyncSocket LFData];
-    while (YES) {
-        NSRange nlRange = [_readBuffer rangeOfData:lfData options:0 range:NSMakeRange(0, _readBuffer.length)];
-        if (nlRange.location == NSNotFound) {
-            break;
-        }
-        NSData *frameData = [_readBuffer subdataWithRange:NSMakeRange(0, nlRange.location)];
-        [_readBuffer replaceBytesInRange:NSMakeRange(0, nlRange.location + 1) withBytes:NULL length:0];
-
-        if (frameData.length > 0 && ((const uint8_t *)frameData.bytes)[frameData.length - 1] == '\r') {
-            frameData = [frameData subdataWithRange:NSMakeRange(0, frameData.length - 1)];
-        }
-        if (frameData.length == 0) {
-            continue;
-        }
-
-        NSString *str = [[NSString alloc] initWithData:frameData encoding:NSUTF8StringEncoding];
-        if (str == nil || str.length == 0) {
-            DLog("BLUEBUBBLESFACETIMEHELPER: Dropping invalid UTF-8 socket frame (%lu bytes)", (unsigned long)frameData.length);
-            continue;
-        }
+    for (NSString *str in messagesToDispatch) {
         DLog("BLUEBUBBLESFACETIMEHELPER: event: %{public}@ socket:%{public}p didReadData:withTag:%{public}ld", str, sock, tag);
         if (messageReceivedBlock != nil) {
             messageReceivedBlock(self, str);

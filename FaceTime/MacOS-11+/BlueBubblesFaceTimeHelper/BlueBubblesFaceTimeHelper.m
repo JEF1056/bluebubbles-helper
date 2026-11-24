@@ -168,20 +168,23 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
 
 // Called when macforge initializes the plugin
 + (void)load {
-    // Create the singleton
-    plugin = [BLUEBUBBLESFACETIMEHELPER sharedInstance];
+    NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+    if (![bundleID isEqualToString:@"com.apple.FaceTime"] && ![bundleID isEqualToString:@"com.apple.TelephonyUtilities"]) {
+        DLog("BLUEBUBBLESFACETIMEHELPER: Injected into non-FaceTime process %@, aborting.", bundleID);
+        return;
+    }
 
-    // Get OS version for debugging purposes
-    NSUInteger major = [[NSProcessInfo processInfo] operatingSystemVersion].majorVersion;
-    NSUInteger minor = [[NSProcessInfo processInfo] operatingSystemVersion].minorVersion;
-    DLog("BLUEBUBBLESFACETIMEHELPER: %{public}@ loaded into %{public}@ on macOS %ld.%ld", [self className], [[NSBundle mainBundle] bundleIdentifier], (long)major, (long)minor);
+    // Defer initialization to avoid work under dyld loader lock
+    dispatch_async(dispatch_get_main_queue(), ^{
+        plugin = [BLUEBUBBLESFACETIMEHELPER sharedInstance];
 
-    if ([[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.FaceTime"] || [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.TelephonyUtilities"]) {
+        NSUInteger major = [[NSProcessInfo processInfo] operatingSystemVersion].majorVersion;
+        NSUInteger minor = [[NSProcessInfo processInfo] operatingSystemVersion].minorVersion;
+        DLog("BLUEBUBBLESFACETIMEHELPER: %{public}@ loaded into %{public}@ on macOS %ld.%ld", [self className], bundleID, (long)major, (long)minor);
+
         DLog("BLUEBUBBLESFACETIMEHELPER: Deferring connection until app launch...");
         if (NSApp != nil && [NSApp isRunning]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [plugin initializeNetworkController];
-            });
+            [plugin initializeNetworkController];
         } else {
             __block id launchObserver = nil;
             launchObserver = [[NSNotificationCenter defaultCenter] addObserverForName:NSApplicationDidFinishLaunchingNotification
@@ -197,10 +200,7 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
                 [plugin initializeNetworkController];
             }];
         }
-    } else {
-        DLog("BLUEBUBBLESFACETIMEHELPER: Injected into non-FaceTime process %@, aborting.", [[NSBundle mainBundle] bundleIdentifier]);
-        return;
-    }
+    });
 }
 
 -(void) DumpObjcMethods:(Class) clz {
@@ -365,7 +365,7 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
                 return;
             }
             if ([manager respondsToSelector:@selector(generateLinkWithInvitedMemberHandles:linkLifetimeScope:completionHandler:)]) {
-                [manager generateLinkWithInvitedMemberHandles:@[] linkLifetimeScope:0 completionHandler:^(TUConversationLink *arg0, NSError *arg1) {
+                [manager generateLinkWithInvitedMemberHandles:[NSSet set] linkLifetimeScope:0 completionHandler:^(TUConversationLink *arg0, NSError *arg1) {
                     [self sendGeneratedLinkReply:arg0 error:arg1 transaction:transaction replyController:replyController];
                 }];
             } else {
@@ -386,7 +386,7 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
         TUConversation *convo = nil;
 
         for (TUConversation *i in [self conversationCandidatesForManager:manager]) {
-            if ([[[i groupUUID] UUIDString] isEqualToString:targetConvUUID]) {
+            if ([[[i groupUUID] UUIDString] caseInsensitiveCompare:targetConvUUID] == NSOrderedSame) {
                 convo = i;
                 break;
             }
@@ -460,17 +460,18 @@ BLUEBUBBLESFACETIMEHELPER *plugin;
 
         void (^onDone)(char, NSError *) = ^(char arg0, NSError *arg1) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                finishReply(arg1 != nil ? @{@"error": arg1.localizedDescription ?: @"Failed to invalidate link!"} : nil);
+                BOOL ok = (arg0 != 0);
+                finishReply((ok && arg1 == nil) ? nil : @{@"error": arg1.localizedDescription ?: @"Failed to invalidate link!"});
             });
         };
         if ([manager respondsToSelector:@selector(invalidateLink:completionHandler:)]) {
             [manager invalidateLink:matchedLink completionHandler:onDone];
         } else {
             xpcClient = [[TUConversationManagerXPCClient alloc] init];
-            if (xpcClient != nil) {
+            if (xpcClient != nil && [xpcClient respondsToSelector:@selector(invalidateLink:completionHandler:)]) {
                 [xpcClient invalidateLink:matchedLink completionHandler:onDone];
             } else {
-                finishReply(@{@"error": @"Failed to invalidate link!"});
+                finishReply(@{@"error": @"Failed to invalidate link (XPC client unavailable)!"});
             }
         }
     }
